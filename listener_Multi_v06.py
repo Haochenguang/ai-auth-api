@@ -143,4 +143,4 @@ if __name__ == "__main__":
         time.sleep(1)
         
     print("\n[*] 正在启动本地 API 服务，端口 5000...")
-    app.run(host='0.0.0.0', port=8080)
+    app.run(host='0.0.0.0', port=5000)
