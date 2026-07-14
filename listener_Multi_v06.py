@@ -80,6 +80,8 @@ def monitor_single_account(email_account, app_password):
                             server.add_flags(uid, '\\Seen')
                         server.idle()
         except Exception as e:
+            # 增加了错误打印，不再做闷葫芦
+            print(f"[❌ 异常] 邮箱 {email_account} 监听中断，原因: {e}。10秒后重试...")
             time.sleep(10)
 
 # ----- 核心桥接与独立计时防顶号 API 接口 -----
