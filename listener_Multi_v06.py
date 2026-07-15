@@ -14,6 +14,7 @@ ACCOUNTS = [
     {"email": "SBF_AI_01@superbonfire.com", "password": "3bo8gE496FeIloAm"},
     {"email": "SBF_AI_02@superbonfire.com", "password": "qjc6s8seOHInCqKo"},
     {"email": "SBF_AI_03@superbonfire.com", "password": "0guuq9iMlyMIW1lS"},
+    {"email": "SBF_AI_04@superbonfire.com", "password": "zZlbbc43a5zUmsvQ"},
     {"email": "SBF_AI_05@superbonfire.com", "password": "bsIZsi0QWdD72Aib"},
 ]
 
@@ -24,8 +25,8 @@ PLATFORM_LIMITS = {
     'midjourney': 2,    # 每个邮箱允许2人
     'chatgpt': 5,       # 每个邮箱允许5人
     'jimeng': 10,       # 每个邮箱允许10人
-    'keling': 10        # 每个邮箱允许10人
-    'superbonfire': 10        # 每个邮箱允许10人
+    'keling': 10,       # 每个邮箱允许10人
+    'superbonfire': 10  # 每个邮箱允许10人
    
 }
 # ============================================
