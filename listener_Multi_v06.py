@@ -20,24 +20,23 @@ ACCOUNTS = [
 
 # ⬇️ 差异化并发核心：在这里自由配置【每个独立账号】的最高人数上限！
 PLATFORM_LIMITS = {
-    'seedance': 1,      # 每个邮箱允许1人
+    #'seedance': 1,      # 每个邮箱允许1人
     'lovart': 2,        # 每个邮箱允许2人
-    'midjourney': 2,    # 每个邮箱允许2人
+    #'midjourney': 2,    # 每个邮箱允许2人
     'chatgpt': 5,       # 每个邮箱允许5人
     'jimeng': 10,       # 每个邮箱允许10人
     'keling': 10,       # 每个邮箱允许10人
     'superbonfire': 10  # 每个邮箱允许10人
-   
 }
 # ============================================
 
 TARGET_PLATFORMS = list(PLATFORM_LIMITS.keys())
 EMAIL_LIST = [acc["email"] for acc in ACCOUNTS]
 
-# 🧠 记忆升级：不仅存验证码，还要存这个码是【哪个邮箱】收到的
+# 记录最新验证码的临时仓库
 code_storage = {platform: None for platform in TARGET_PLATFORMS}
 
-# 📒 账本升级：二维独立账本 [邮箱][平台]
+# 独立计时锁二维账本 [邮箱][平台]
 lock_storage = {
     email_acc: {
         platform: {"owners": {}} for platform in TARGET_PLATFORMS
@@ -48,18 +47,26 @@ LOCK_DURATION = 30 * 60  # 每个人独立的锁定时间（30 分钟）
 
 app = Flask(__name__)
 
-def parse_verification_code(email_message):
-    body = ""
-    if email_message.is_multipart():
-        for part in email_message.walk():
-            if part.get_content_type() in ["text/plain", "text/html"]:
-                payload = part.get_payload(decode=True)
-                if payload: body += payload.decode(errors='ignore')
-    else:
-        payload = email_message.get_payload(decode=True)
-        if payload: body = payload.decode(errors='ignore')
-
-    match = re.search(r'\b\d{4,6}\b', body)
+def parse_verification_code_with_context(body, platform):
+    """
+    智能解析验证码：专为短信转发优化，防止干扰数字
+    """
+    body_lower = body.lower()
+    
+    # 1. 尝试匹配平台名称后面临近的 4-6 位数字（最精准）
+    # 比如 "Lovart verification code: 1234" 或 "您的 Lovart 验证码为 1234"
+    # 限制在平台名后的 40 个字符以内寻找
+    match = re.search(rf"{platform}[^0-9]{{0,40}}\b(\d{{4,6}})\b", body_lower)
+    if match:
+        return match.group(1)
+        
+    # 2. 如果没找到，先清理掉常见的干扰数字（如 106 开头的服务商长号、时间戳等）
+    clean_body = re.sub(r'\b106\d+\b', '', body)
+    clean_body = re.sub(r'\d{4}-\d{2}-\d{2}', '', clean_body) # 过滤日期
+    clean_body = re.sub(r'\d{2}:\d{2}', '', clean_body)       # 过滤时间
+    
+    # 3. 兜底寻找剩下文本中的 4-6 位数字
+    match = re.search(r'\b\d{4,6}\b', clean_body)
     return match.group(0) if match else None
 
 def monitor_single_account(email_account, app_password):
@@ -78,14 +85,46 @@ def monitor_single_account(email_account, app_password):
                         for uid, message_data in server.fetch(messages, 'RFC822').items():
                             msg = email.message_from_bytes(message_data[b'RFC822'])
                             sender = msg.get("From", "").lower()
+                            subject = msg.get("Subject", "")
                             
+                            # 解码邮件主题，兼容中文和各种短信转发助手的主题格式
+                            try:
+                                decoded_subject = ""
+                                for part, encoding in decode_header(subject):
+                                    if isinstance(part, bytes):
+                                        decoded_subject += part.decode(encoding or 'utf-8', errors='ignore')
+                                    else:
+                                        decoded_subject += part
+                                subject_str = decoded_subject.lower()
+                            except Exception:
+                                subject_str = str(subject).lower()
+
+                            # 提取邮件正文
+                            body = ""
+                            if msg.is_multipart():
+                                for part in msg.walk():
+                                    if part.get_content_type() in ["text/plain", "text/html"]:
+                                        payload = part.get_payload(decode=True)
+                                        if payload: body += payload.decode(errors='ignore')
+                            else:
+                                payload = msg.get_payload(decode=True)
+                                if payload: body = payload.decode(errors='ignore')
+                            
+                            body_lower = body.lower()
+
+                            # 智能匹配平台逻辑
                             for platform in TARGET_PLATFORMS:
-                                if platform in sender:
-                                    code = parse_verification_code(msg)
+                                # 判断是否是“短信转发邮件”
+                                # 如果发件人、主题或正文包含常见转发标识，或者邮件正文中包含平台关键字
+                                is_forwarded = any(k in sender or k in subject_str or k in body_lower for k in ["forward", "sms", "短信", "转发", "phone"])
+                                
+                                # 准入判定：或者是原生邮件（平台在发件人里），或者是安全转发邮件（平台在正文/主题里）
+                                if (platform in sender) or (is_forwarded and (platform in body_lower or platform in subject_str)):
+                                    code = parse_verification_code_with_context(body, platform)
                                     if code:
-                                        print(f"【💥 捕获验证码】邮箱: {email_account} | 平台: {platform} | 码: {code}")
-                                        # 记录验证码时，绑定来源邮箱
+                                        print(f"【💥 捕获验证码】邮箱: {email_account} | 平台: {platform} | 码: {code} (来源账号: {email_account})")
                                         code_storage[platform] = {"code": code, "email": email_account}
+                                        
                             server.add_flags(uid, '\\Seen')
                         server.idle()
         except Exception as e:
@@ -118,12 +157,10 @@ def get_code_api():
     if not latest_data:
         return jsonify({"status": "error", "message": "未收到最新验证码，请先在 AI 平台点击发送！"})
 
-    # 解析当前验证码是属于哪个邮箱的
     target_email = latest_data["email"]
     code = latest_data["code"]
     max_users_allowed = PLATFORM_LIMITS[platform]
     
-    # 定位到这个特定邮箱的账本
     lock_info = lock_storage[target_email][platform]
 
     # 3. 🛑 核心拦截逻辑（只针对当前这个邮箱）
@@ -146,7 +183,7 @@ def get_code_api():
     return jsonify({"status": "success", "code": code})
 
 if __name__ == "__main__":
-    print("==================== 安全验证中心 (独立账号池版) ====================")
+    print("==================== 安全验证中心 (独立账号池+兼容短信转发版) ====================")
     
     for acc in ACCOUNTS:
         t = threading.Thread(target=monitor_single_account, args=(acc["email"], acc["password"]))
