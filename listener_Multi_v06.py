@@ -18,14 +18,24 @@ ACCOUNTS = [
     {"email": "SBF_AI_05@superbonfire.com", "password": "bsIZsi0QWdD72Aib"},
 ]
 
-# ⬇️ 差异化并发核心：在这里自由配置【每个独立账号】的最高人数上限！
+# ⬇️ 并发上限配置
 PLATFORM_LIMITS = {
-    #'seedance': 1,      # 每个邮箱允许1人
-    'lovart': 2,        # 每个邮箱允许2人
-    #'midjourney': 2,    # 每个邮箱允许2人
-    'chatgpt': 5,       # 每个邮箱允许5人
-    'jimeng': 10,       # 每个邮箱允许10人
-    'keling': 10        # 每个邮箱允许10人
+    #'seedance': 1,      
+    'lovart': 2,        
+    # 'midjourney': 2,    
+    'chatgpt': 5,       
+    'jimeng': 10,       
+    'keling': 10        
+}
+
+# ⬇️ 🎯 核心新增：中英文搜索雷达（在这里添加中文识别词）
+PLATFORM_KEYWORDS = {
+    #'seedance': ['seedance'],
+    'lovart': ['lovart'],
+   # 'midjourney': ['midjourney'],
+    'chatgpt': ['chatgpt', 'openai'], # OpenAI 的邮件里可能没有 chatgpt 字眼，加上 openai 防漏
+    'jimeng': ['jimeng', '即梦'],
+    'keling': ['keling', '可灵']
 }
 # ============================================
 
@@ -46,20 +56,18 @@ LOCK_DURATION = 30 * 60  # 每个人独立的锁定时间（30 分钟）
 
 app = Flask(__name__)
 
-def parse_verification_code_with_context(body, platform):
+def parse_verification_code_with_context(body, keyword):
     """
-    智能解析验证码：专为短信转发优化，防止干扰数字
+    智能解析验证码：围绕着“触发词(比如'即梦')”去寻找数字
     """
     body_lower = body.lower()
     
-    # 1. 尝试匹配平台名称后面临近的 4-6 位数字（最精准）
-    # 比如 "Lovart verification code: 1234" 或 "您的 Lovart 验证码为 1234"
-    # 限制在平台名后的 40 个字符以内寻找
-    match = re.search(rf"{platform}[^0-9]{{0,40}}\b(\d{{4,6}})\b", body_lower)
+    # 1. 尝试匹配关键字后面临近的 4-6 位数字
+    match = re.search(rf"{keyword}[^0-9]{{0,40}}\b(\d{{4,6}})\b", body_lower)
     if match:
         return match.group(1)
         
-    # 2. 如果没找到，先清理掉常见的干扰数字（如 106 开头的服务商长号、时间戳等）
+    # 2. 如果没找到，先清理掉常见的干扰数字
     clean_body = re.sub(r'\b106\d+\b', '', body)
     clean_body = re.sub(r'\d{4}-\d{2}-\d{2}', '', clean_body) # 过滤日期
     clean_body = re.sub(r'\d{2}:\d{2}', '', clean_body)       # 过滤时间
@@ -86,7 +94,6 @@ def monitor_single_account(email_account, app_password):
                             sender = msg.get("From", "").lower()
                             subject = msg.get("Subject", "")
                             
-                            # 解码邮件主题，兼容中文和各种短信转发助手的主题格式
                             try:
                                 decoded_subject = ""
                                 for part, encoding in decode_header(subject):
@@ -98,7 +105,6 @@ def monitor_single_account(email_account, app_password):
                             except Exception:
                                 subject_str = str(subject).lower()
 
-                            # 提取邮件正文
                             body = ""
                             if msg.is_multipart():
                                 for part in msg.walk():
@@ -111,17 +117,24 @@ def monitor_single_account(email_account, app_password):
                             
                             body_lower = body.lower()
 
-                            # 智能匹配平台逻辑
+                            # 🎯 智能多语言匹配逻辑
                             for platform in TARGET_PLATFORMS:
-                                # 判断是否是“短信转发邮件”
-                                # 如果发件人、主题或正文包含常见转发标识，或者邮件正文中包含平台关键字
+                                # 去字典里拿这个平台的所有搜索词，没有的话就默认用它自己的英文名
+                                keywords = PLATFORM_KEYWORDS.get(platform, [platform])
                                 is_forwarded = any(k in sender or k in subject_str or k in body_lower for k in ["forward", "sms", "短信", "转发", "phone"])
                                 
-                                # 准入判定：或者是原生邮件（平台在发件人里），或者是安全转发邮件（平台在正文/主题里）
-                                if (platform in sender) or (is_forwarded and (platform in body_lower or platform in subject_str)):
-                                    code = parse_verification_code_with_context(body, platform)
+                                matched_kw = None
+                                for kw in keywords:
+                                    # 只要发件人、正文或主题里命中任意一个词（比如命中了“即梦”），就判定成功
+                                    if (kw in sender) or (is_forwarded and (kw in body_lower or kw in subject_str)):
+                                        matched_kw = kw
+                                        break
+                                
+                                if matched_kw:
+                                    # 把命中的中文词传给解析器，让它去这个中文词附近找验证码
+                                    code = parse_verification_code_with_context(body, matched_kw)
                                     if code:
-                                        print(f"【💥 捕获验证码】邮箱: {email_account} | 平台: {platform} | 码: {code} (来源账号: {email_account})")
+                                        print(f"【💥 捕获验证码】邮箱: {email_account} | 平台: {platform} (触发词:{matched_kw}) | 码: {code}")
                                         code_storage[platform] = {"code": code, "email": email_account}
                                         
                             server.add_flags(uid, '\\Seen')
@@ -130,7 +143,7 @@ def monitor_single_account(email_account, app_password):
             print(f"[❌ 异常] 邮箱 {email_account} 监听中断，原因: {e}。10秒后重试...")
             time.sleep(10)
 
-# ----- 核心桥接与独立计时防顶号 API 接口 -----
+# ----- API 接口部分保持完全不变 -----
 @app.route('/api/get_code', methods=['GET'])
 def get_code_api():
     platform = request.args.get('platform')
@@ -143,15 +156,12 @@ def get_code_api():
 
     current_time = time.time()
     
-    # 1. 🧹 自动清理【所有邮箱】下到期的名额
     for email_acc in lock_storage:
         owners = lock_storage[email_acc][platform]["owners"]
         expired_macs = [m for m, t in owners.items() if current_time >= t]
         for m in expired_macs:
             del owners[m]
-            print(f"[名额释放] 终端 {m} 在账号 {email_acc} 的 {platform} 独占已结束。")
 
-    # 2. 检查是否有最新的验证码
     latest_data = code_storage.get(platform)
     if not latest_data:
         return jsonify({"status": "error", "message": "未收到最新验证码，请先在 AI 平台点击发送！"})
@@ -162,27 +172,21 @@ def get_code_api():
     
     lock_info = lock_storage[target_email][platform]
 
-    # 3. 🛑 核心拦截逻辑（只针对当前这个邮箱）
     if mac not in lock_info["owners"] and len(lock_info["owners"]) >= max_users_allowed:
         earliest_expire = min(lock_info["owners"].values())
         remaining_minutes = int((earliest_expire - current_time) / 60) + 1
-        
-        print(f"[拦截记录] 拒绝终端 {mac}。{target_email} 的 {platform} 已满员。")
         return jsonify({
             "status": "error", 
             "message": f"当前账号 ({target_email}) 已有 {max_users_allowed} 人使用，名额已满！\n(请换一个没人用的公司邮箱账号发送验证码，\n或等待 {remaining_minutes} 分钟)。"
         })
 
-    # 4. 正常下发逻辑
-    code_storage[platform] = None  # 验证码用完即毁，防止重复提取
+    code_storage[platform] = None 
     lock_info["owners"][mac] = current_time + LOCK_DURATION
-    current_occupancy = len(lock_info["owners"])
     
-    print(f"[授权成功] {platform} 发给 {mac}。占用账号: {target_email} ({current_occupancy}/{max_users_allowed})。")
     return jsonify({"status": "success", "code": code})
 
 if __name__ == "__main__":
-    print("==================== 安全验证中心 ====================")
+    print("==================== 安全验证中心 (多语言中文雷达版) ====================")
     
     for acc in ACCOUNTS:
         t = threading.Thread(target=monitor_single_account, args=(acc["email"], acc["password"]))
@@ -190,5 +194,4 @@ if __name__ == "__main__":
         t.start()
         time.sleep(1)
         
-    print("\n[*] 正在启动本地 API 服务，端口 5000...")
     app.run(host='0.0.0.0', port=5000)
