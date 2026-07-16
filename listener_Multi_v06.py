@@ -3,6 +3,7 @@ import re
 import email
 from email.header import decode_header
 import threading
+import html  # ⭐ 新增：专门用于解析和卸妆网页邮件的官方利器
 from imapclient import IMAPClient
 from flask import Flask, request, jsonify
 
@@ -20,16 +21,16 @@ ACCOUNTS = [
 PLATFORM_LIMITS = {
     #'seedance': 1,      
     'lovart': 2,        
-   # 'midjourney': 2,    
+    #'midjourney': 2,    
     'chatgpt': 5,       
     'jimeng': 10,       
     'keling': 10        
 }
 
 PLATFORM_KEYWORDS = {
-   # 'seedance': ['seedance'],
+    #'seedance': ['seedance'],
     'lovart': ['lovart'],
-   # 'midjourney': ['midjourney'],
+    #'midjourney': ['midjourney'],
     'chatgpt': ['chatgpt', 'openai'], 
     'jimeng': ['jimeng', '即梦'],
     'keling': ['keling', '可灵']
@@ -48,24 +49,39 @@ app = Flask(__name__)
 
 def parse_verification_code_with_context(text, keywords):
     """
-    智能解析验证码：同时使用多个关键词(中英文)去锁定验证码
+    智能解析验证码：先卸妆，再搜索。完美免疫 HTML 邮件中的 CSS/色号 干扰！
     """
-    text_lower = text.lower()
+    # --- 1. 终极 HTML 卸妆术 ---
+    # 删掉 CSS 和 JS 块，屏蔽所有诸如 #333333 这种隐藏颜色代码
+    clean_text = re.sub(r'<style.*?>.*?</style>', ' ', text, flags=re.IGNORECASE|re.DOTALL)
+    clean_text = re.sub(r'<script.*?>.*?</script>', ' ', clean_text, flags=re.IGNORECASE|re.DOTALL)
     
-    # 1. 遍历所有可能的中英文触发词，只要谁旁边有数字，就抓谁
+    # 扒掉所有 HTML 标签 (<...>)
+    clean_text = re.sub(r'<[^>]+>', ' ', clean_text)
+    
+    # 将网页转义符（如 &nbsp;）翻译成真实文字
+    clean_text = html.unescape(clean_text)
+    
+    # 把文本彻底展平（将多个换行和空格压缩成一个空格）
+    clean_text = re.sub(r'\s+', ' ', clean_text)
+    clean_text_lower = clean_text.lower()
+    
+    # --- 2. 匹配逻辑 ---
     for kw in keywords:
-        match = re.search(rf"{kw}[^0-9]{{0,40}}?(?<!\d)(\d{{4,6}})(?!\d)", text_lower)
+        match = re.search(rf"{kw}[^0-9]{{0,40}}?(?<!\d)(\d{{4,6}})(?!\d)", clean_text_lower)
         if match:
             return match.group(1)
             
-    # 2. 强力净化过滤区
-    clean_text = re.sub(r'(?<!\d)106\d+(?!\d)', '', text)               # 过滤长串服务号
-    clean_text = re.sub(r'(?i)uid\s*[:：]?\s*\d+', '', clean_text)       # 过滤 UID 等干扰 (去除了边界符，更强力)
-    clean_text = re.sub(r'\d{4}-\d{2}-\d{2}', '', clean_text)           # 过滤日期
-    clean_text = re.sub(r'\d{2}:\d{2}(:\d{2})?', '', clean_text)         # 过滤时间
-    
-    # 3. 兜底寻找
-    match = re.search(r'(?<!\d)\d{4,6}(?!\d)', clean_text)
+    # --- 3. 强力净化区（排雷） ---
+    filtered_text = re.sub(r'(?<!\d)106\d+(?!\d)', ' ', clean_text)               
+    filtered_text = re.sub(r'(?i)uid\s*[:：]?\s*\d+', ' ', filtered_text)       
+    filtered_text = re.sub(r'\d{4}-\d{2}-\d{2}', ' ', filtered_text)           
+    filtered_text = re.sub(r'\d{2}:\d{2}(:\d{2})?', ' ', filtered_text)         
+    # 顺手过滤掉邮件底部的版权年份声明 (如 © 2024, 2026)，防止误抓
+    filtered_text = re.sub(r'(?i)(copyright|©)\s*\d{4}', ' ', filtered_text)
+
+    # --- 4. 兜底寻找真正的验证码 ---
+    match = re.search(r'(?<!\d)\d{4,6}(?!\d)', filtered_text)
     return match.group(0) if match else None
 
 def monitor_single_account(email_account, app_password):
@@ -107,14 +123,12 @@ def monitor_single_account(email_account, app_password):
                                 payload = msg.get_payload(decode=True)
                                 if payload: body = payload.decode(errors='ignore')
                             
-                            # ⭐ 核心升级：把主题和正文揉在一起，防止企业微信把文字藏在标题里
                             full_text = subject_str + " \n " + body
                             full_text_lower = full_text.lower()
 
                             for platform in TARGET_PLATFORMS:
                                 keywords = PLATFORM_KEYWORDS.get(platform, [platform])
                                 
-                                # 只要发件人、主题、或者正文里有任何一个属于该平台的词，就锁定！
                                 platform_matched = False
                                 for kw in keywords:
                                     if kw in sender or kw in full_text_lower:
@@ -122,7 +136,6 @@ def monitor_single_account(email_account, app_password):
                                         break
                                 
                                 if platform_matched:
-                                    # 把整段文字和【所有的关键词】都传给解析器
                                     code = parse_verification_code_with_context(full_text, keywords)
                                     if code:
                                         print(f"【💥 捕获验证码】邮箱: {email_account} | 平台: {platform} | 码: {code}")
@@ -134,7 +147,6 @@ def monitor_single_account(email_account, app_password):
             print(f"[❌ 异常] 邮箱 {email_account} 监听中断，原因: {e}。10秒后重试...")
             time.sleep(10)
 
-# ----- API 接口保持不变 -----
 @app.route('/api/get_code', methods=['GET'])
 def get_code_api():
     platform = request.args.get('platform')
@@ -175,11 +187,10 @@ def get_code_api():
     lock_info["owners"][mac] = current_time + LOCK_DURATION
     current_occupancy = len(lock_info["owners"])
     
-    print(f"[授权成功] {platform} 发给 {mac}。占用账号: {target_email} ({current_occupancy}/{max_users_allowed})。")
     return jsonify({"status": "success", "code": code})
 
 if __name__ == "__main__":
-    print("==================== 安全验证中心 (全视野无死角版) ====================")
+    print("==================== 安全验证中心 (卸妆抗干扰版) ====================")
     for acc in ACCOUNTS:
         t = threading.Thread(target=monitor_single_account, args=(acc["email"], acc["password"]))
         t.daemon = True
