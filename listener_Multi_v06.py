@@ -9,7 +9,6 @@ from flask import Flask, request, jsonify
 # ================= 🔧 配置区 =================
 FEISHU_IMAP_SERVER = 'imap.feishu.cn'
 
-# 在这里填入你要监听的所有飞书邮箱
 ACCOUNTS = [
     {"email": "SBF_AI_01@superbonfire.com", "password": "3bo8gE496FeIloAm"},
     {"email": "SBF_AI_02@superbonfire.com", "password": "qjc6s8seOHInCqKo"},
@@ -18,19 +17,17 @@ ACCOUNTS = [
     {"email": "SBF_AI_05@superbonfire.com", "password": "bsIZsi0QWdD72Aib"},
 ]
 
-# ⬇️ 差异化并发核心：在这里自由配置【每个独立账号】的最高人数上限！
 PLATFORM_LIMITS = {
     #'seedance': 1,      
     'lovart': 2,        
-    #'midjourney': 2,    
+   # 'midjourney': 2,    
     'chatgpt': 5,       
     'jimeng': 10,       
     'keling': 10        
 }
 
-# ⬇️ 🎯 中英文搜索雷达：添加所有的识别触发词
 PLATFORM_KEYWORDS = {
-    #'seedance': ['seedance'],
+   # 'seedance': ['seedance'],
     'lovart': ['lovart'],
    # 'midjourney': ['midjourney'],
     'chatgpt': ['chatgpt', 'openai'], 
@@ -42,42 +39,33 @@ PLATFORM_KEYWORDS = {
 TARGET_PLATFORMS = list(PLATFORM_LIMITS.keys())
 EMAIL_LIST = [acc["email"] for acc in ACCOUNTS]
 
-# 记录最新验证码的临时仓库
 code_storage = {platform: None for platform in TARGET_PLATFORMS}
+lock_storage = {email_acc: {platform: {"owners": {}} for platform in TARGET_PLATFORMS} for email_acc in EMAIL_LIST}
 
-# 独立计时锁二维账本 [邮箱][平台]
-lock_storage = {
-    email_acc: {
-        platform: {"owners": {}} for platform in TARGET_PLATFORMS
-    } for email_acc in EMAIL_LIST
-}
-
-LOCK_DURATION = 30 * 60  # 每个人独立的锁定时间（30 分钟）
+LOCK_DURATION = 30 * 60  
 
 app = Flask(__name__)
 
-def parse_verification_code_with_context(body, keyword):
+def parse_verification_code_with_context(text, keywords):
     """
-    智能解析验证码：修复中文与数字紧贴导致的边界识别失效问题
+    智能解析验证码：同时使用多个关键词(中英文)去锁定验证码
     """
-    body_lower = body.lower()
+    text_lower = text.lower()
     
-    # 1. 尝试匹配关键字后面临近的 4-6 位数字
-    match = re.search(rf"{keyword}[^0-9]{{0,40}}?(?<!\d)(\d{{4,6}})(?!\d)", body_lower)
-    if match:
-        return match.group(1)
-        
-    # 2. 如果没找到，进行深度净化，排除所有干扰数字
-    clean_body = re.sub(r'(?<!\d)106\d+(?!\d)', '', body)               # 过滤长串服务号
+    # 1. 遍历所有可能的中英文触发词，只要谁旁边有数字，就抓谁
+    for kw in keywords:
+        match = re.search(rf"{kw}[^0-9]{{0,40}}?(?<!\d)(\d{{4,6}})(?!\d)", text_lower)
+        if match:
+            return match.group(1)
+            
+    # 2. 强力净化过滤区
+    clean_text = re.sub(r'(?<!\d)106\d+(?!\d)', '', text)               # 过滤长串服务号
+    clean_text = re.sub(r'(?i)uid\s*[:：]?\s*\d+', '', clean_text)       # 过滤 UID 等干扰 (去除了边界符，更强力)
+    clean_text = re.sub(r'\d{4}-\d{2}-\d{2}', '', clean_text)           # 过滤日期
+    clean_text = re.sub(r'\d{2}:\d{2}(:\d{2})?', '', clean_text)         # 过滤时间
     
-    # ⭐【新增强力过滤】：彻底抹除类似 "UID: 10108"、"uid：12345" 等干扰项
-    clean_body = re.sub(r'(?i)\buid\s*[:：]?\s*\d+\b', '', clean_body)
-    
-    clean_body = re.sub(r'\d{4}-\d{2}-\d{2}', '', clean_body)           # 过滤日期
-    clean_body = re.sub(r'\d{2}:\d{2}(:\d{2})?', '', clean_body)         # 过滤时间 (含带秒的 16:35:35)
-    
-    # 3. 兜底寻找剩下文本中的 4-6 位数字
-    match = re.search(r'(?<!\d)\d{4,6}(?!\d)', clean_body)
+    # 3. 兜底寻找
+    match = re.search(r'(?<!\d)\d{4,6}(?!\d)', clean_text)
     return match.group(0) if match else None
 
 def monitor_single_account(email_account, app_password):
@@ -119,23 +107,25 @@ def monitor_single_account(email_account, app_password):
                                 payload = msg.get_payload(decode=True)
                                 if payload: body = payload.decode(errors='ignore')
                             
-                            body_lower = body.lower()
+                            # ⭐ 核心升级：把主题和正文揉在一起，防止企业微信把文字藏在标题里
+                            full_text = subject_str + " \n " + body
+                            full_text_lower = full_text.lower()
 
-                            # 🎯 智能多语言匹配逻辑
                             for platform in TARGET_PLATFORMS:
                                 keywords = PLATFORM_KEYWORDS.get(platform, [platform])
-                                is_forwarded = any(k in sender or k in subject_str or k in body_lower for k in ["forward", "sms", "短信", "转发", "phone"])
                                 
-                                matched_kw = None
+                                # 只要发件人、主题、或者正文里有任何一个属于该平台的词，就锁定！
+                                platform_matched = False
                                 for kw in keywords:
-                                    if (kw in sender) or (is_forwarded and (kw in body_lower or kw in subject_str)):
-                                        matched_kw = kw
+                                    if kw in sender or kw in full_text_lower:
+                                        platform_matched = True
                                         break
                                 
-                                if matched_kw:
-                                    code = parse_verification_code_with_context(body, matched_kw)
+                                if platform_matched:
+                                    # 把整段文字和【所有的关键词】都传给解析器
+                                    code = parse_verification_code_with_context(full_text, keywords)
                                     if code:
-                                        print(f"【💥 捕获验证码】邮箱: {email_account} | 平台: {platform} (触发词:{matched_kw}) | 码: {code}")
+                                        print(f"【💥 捕获验证码】邮箱: {email_account} | 平台: {platform} | 码: {code}")
                                         code_storage[platform] = {"code": code, "email": email_account}
                                         
                             server.add_flags(uid, '\\Seen')
@@ -144,7 +134,7 @@ def monitor_single_account(email_account, app_password):
             print(f"[❌ 异常] 邮箱 {email_account} 监听中断，原因: {e}。10秒后重试...")
             time.sleep(10)
 
-# ----- 核心桥接与独立计时防顶号 API 接口 -----
+# ----- API 接口保持不变 -----
 @app.route('/api/get_code', methods=['GET'])
 def get_code_api():
     platform = request.args.get('platform')
@@ -157,15 +147,12 @@ def get_code_api():
 
     current_time = time.time()
     
-    # 1. 🧹 自动清理
     for email_acc in lock_storage:
         owners = lock_storage[email_acc][platform]["owners"]
         expired_macs = [m for m, t in owners.items() if current_time >= t]
         for m in expired_macs:
             del owners[m]
-            print(f"[名额释放] 终端 {m} 在账号 {email_acc} 的 {platform} 独占已结束。")
 
-    # 2. 检查验证码
     latest_data = code_storage.get(platform)
     if not latest_data:
         return jsonify({"status": "error", "message": "未收到最新验证码，请先在 AI 平台点击发送！"})
@@ -176,18 +163,14 @@ def get_code_api():
     
     lock_info = lock_storage[target_email][platform]
 
-    # 3. 🛑 拦截满员
     if mac not in lock_info["owners"] and len(lock_info["owners"]) >= max_users_allowed:
         earliest_expire = min(lock_info["owners"].values())
         remaining_minutes = int((earliest_expire - current_time) / 60) + 1
-        
-        print(f"[拦截记录] 拒绝终端 {mac}。{target_email} 的 {platform} 已满员。")
         return jsonify({
             "status": "error", 
             "message": f"当前账号 ({target_email}) 已有 {max_users_allowed} 人使用，名额已满！\n(请换一个没人用的公司邮箱账号发送验证码，\n或等待 {remaining_minutes} 分钟)。"
         })
 
-    # 4. 授权下发
     code_storage[platform] = None  
     lock_info["owners"][mac] = current_time + LOCK_DURATION
     current_occupancy = len(lock_info["owners"])
@@ -196,13 +179,10 @@ def get_code_api():
     return jsonify({"status": "success", "code": code})
 
 if __name__ == "__main__":
-    print("==================== 安全验证中心 (终极无敌完全避雷版) ====================")
-    
+    print("==================== 安全验证中心 (全视野无死角版) ====================")
     for acc in ACCOUNTS:
         t = threading.Thread(target=monitor_single_account, args=(acc["email"], acc["password"]))
         t.daemon = True
         t.start()
         time.sleep(1)
-        
-    print("\n[*] 正在启动本地 API 服务，端口 5000...")
     app.run(host='0.0.0.0', port=5000)
