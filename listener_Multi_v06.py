@@ -56,7 +56,6 @@ LOCK_DURATION = 30 * 60
 
 app = Flask(__name__)
 
-# 获取真实IP防代理穿透助手函数
 def get_client_ip():
     return request.headers.get('X-Forwarded-For', request.remote_addr).split(',')[0].strip()
 
@@ -64,7 +63,6 @@ def get_client_ip():
 def init_db():
     conn = sqlite3.connect(DB_FILE)
     c = conn.cursor()
-    # 用户表
     c.execute('''
         CREATE TABLE IF NOT EXISTS users (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -73,25 +71,33 @@ def init_db():
             real_name TEXT NOT NULL DEFAULT '未命名',
             last_ip TEXT DEFAULT '未知',
             is_locked INTEGER DEFAULT 0,
+            max_devices INTEGER DEFAULT 1,
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
     ''')
     # 热升级老数据库结构
-    for col, definition in [('real_name', "TEXT DEFAULT '未命名'"), ('last_ip', "TEXT DEFAULT '未知'"), ('is_locked', "INTEGER DEFAULT 0")]:
+    for col, definition in [('real_name', "TEXT DEFAULT '未命名'"), ('last_ip', "TEXT DEFAULT '未知'"), ('is_locked', "INTEGER DEFAULT 0"), ('max_devices', "INTEGER DEFAULT 1")]:
         try: c.execute(f"ALTER TABLE users ADD COLUMN {col} {definition}")
         except sqlite3.OperationalError: pass 
         
-    # 系统设置表（用于动态存储邀请码等）
     c.execute('''CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT)''')
     c.execute("INSERT OR IGNORE INTO settings (key, value) VALUES ('invite_code', ?)", (DEFAULT_INVITE_CODE,))
     
+    # ⭐ 新增：设备绑定记录表
+    c.execute('''
+        CREATE TABLE IF NOT EXISTS user_devices (
+            username TEXT,
+            machine_code TEXT,
+            UNIQUE(username, machine_code)
+        )
+    ''')
+    
     conn.commit()
     conn.close()
-    print("[*] 数据库热升级成功，支持 IP 追踪、封号与动态配置。")
+    print("[*] 数据库热升级成功，已支持机器码设备绑定功能。")
 
 init_db()
 
-# 验证码解析引擎保持不变
 def parse_verification_code_with_context(text, keywords):
     clean_text = re.sub(r'<style.*?>.*?</style>', ' ', text, flags=re.IGNORECASE|re.DOTALL)
     clean_text = re.sub(r'<script.*?>.*?</script>', ' ', clean_text, flags=re.IGNORECASE|re.DOTALL)
@@ -174,7 +180,7 @@ def register_api():
 
     hashed_password = generate_password_hash(password)
     try:
-        c.execute("INSERT INTO users (username, password_hash, real_name, last_ip) VALUES (?, ?, ?, ?)", (username, hashed_password, real_name, client_ip))
+        c.execute("INSERT INTO users (username, password_hash, real_name, last_ip, max_devices) VALUES (?, ?, ?, ?, 1)", (username, hashed_password, real_name, client_ip))
         conn.commit()
         conn.close()
         return jsonify({"status": "success", "message": "注册成功！"})
@@ -185,18 +191,33 @@ def register_api():
 def login_api():
     data = request.json
     username, password = data.get('username'), data.get('password')
+    machine_code = data.get('machine_code') # ⭐ 获取机器码
     client_ip = get_client_ip()
+
+    if not machine_code: return jsonify({"status": "error", "message": "环境异常：无法获取设备物理网卡地址！"})
 
     conn = sqlite3.connect(DB_FILE)
     c = conn.cursor()
-    c.execute("SELECT password_hash, real_name, is_locked FROM users WHERE username=?", (username,))
+    c.execute("SELECT password_hash, real_name, is_locked, max_devices FROM users WHERE username=?", (username,))
     row = c.fetchone()
     
     if row and check_password_hash(row[0], password):
-        if row[2] == 1: # 账号被管理员锁定
+        if row[2] == 1: 
             return jsonify({"status": "error", "message": "账号已被管理员锁定，禁止登录！"})
         
-        # 记录本次登录 IP
+        max_dev = row[3]
+        
+        # ⭐ 核心设备绑定与校验逻辑
+        c.execute("SELECT machine_code FROM user_devices WHERE username=?", (username,))
+        bound_devices = [r[0] for r in c.fetchall()]
+        
+        if machine_code not in bound_devices:
+            if len(bound_devices) >= max_dev:
+                conn.close()
+                return jsonify({"status": "error", "message": f"登录被拒绝：该账号绑定的电脑数量已达上限 ({max_dev}台)。\n请在原办公电脑使用，或联系管理员解绑！"})
+            else:
+                c.execute("INSERT INTO user_devices (username, machine_code) VALUES (?, ?)", (username, machine_code))
+        
         c.execute("UPDATE users SET last_ip=? WHERE username=?", (client_ip, username))
         conn.commit()
         conn.close()
@@ -211,7 +232,6 @@ def get_code_api():
     if not username: return jsonify({"status": "error", "message": "未提供身份标识！"})
     if platform not in PLATFORM_LIMITS: return jsonify({"status": "error", "message": "未知的 AI 平台！"})
 
-    # 验证账号是否被实时踢出
     conn = sqlite3.connect(DB_FILE)
     c = conn.cursor()
     c.execute("SELECT is_locked FROM users WHERE username=?", (username,))
@@ -258,8 +278,6 @@ def get_status_api():
 
 
 # ================= 🛡️ 超级管理员专属 API 接口区 =================
-
-# 权限拦截装饰器替代方案：检查 Admin Secret
 def check_admin(data):
     return data.get('admin_secret') == ADMIN_SECRET
 
@@ -268,8 +286,13 @@ def admin_get_users():
     if not check_admin(request.json): return jsonify({"status": "error", "message": "权限拒绝"}), 403
     conn = sqlite3.connect(DB_FILE)
     c = conn.cursor()
-    c.execute("SELECT id, username, real_name, last_ip, is_locked, created_at FROM users")
-    users = [{"id": r[0], "username": r[1], "real_name": r[2], "last_ip": r[3], "is_locked": bool(r[4]), "created_at": r[5]} for r in c.fetchall()]
+    # 连表查询统计已绑定设备数量
+    c.execute("""
+        SELECT u.id, u.username, u.real_name, u.last_ip, u.is_locked, u.created_at, u.max_devices, 
+               (SELECT COUNT(*) FROM user_devices WHERE username=u.username) as bound_count 
+        FROM users u
+    """)
+    users = [{"id": r[0], "username": r[1], "real_name": r[2], "last_ip": r[3], "is_locked": bool(r[4]), "created_at": r[5], "max_devices": r[6], "bound_count": r[7]} for r in c.fetchall()]
     conn.close()
     return jsonify({"status": "success", "data": users})
 
@@ -287,6 +310,28 @@ def admin_toggle_lock():
     conn.close()
     return jsonify({"status": "success", "message": f"用户 {username} 已{'锁定' if new_status else '解锁'}"})
 
+@app.route('/api/admin/user/set_max_devices', methods=['POST'])
+def admin_set_max_devices():
+    if not check_admin(request.json): return jsonify({"status": "error", "message": "权限拒绝"}), 403
+    username, max_devices = request.json.get('username'), request.json.get('max_devices')
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    c.execute("UPDATE users SET max_devices=? WHERE username=?", (max_devices, username))
+    conn.commit()
+    conn.close()
+    return jsonify({"status": "success", "message": f"用户 {username} 设备上限已修改为 {max_devices} 台"})
+
+@app.route('/api/admin/user/clear_devices', methods=['POST'])
+def admin_clear_devices():
+    if not check_admin(request.json): return jsonify({"status": "error", "message": "权限拒绝"}), 403
+    username = request.json.get('username')
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    c.execute("DELETE FROM user_devices WHERE username=?", (username,))
+    conn.commit()
+    conn.close()
+    return jsonify({"status": "success", "message": f"用户 {username} 的所有绑定电脑已解绑！下一次登录的电脑将自动绑定。"})
+
 @app.route('/api/admin/user/delete', methods=['POST'])
 def admin_delete_user():
     if not check_admin(request.json): return jsonify({"status": "error", "message": "权限拒绝"}), 403
@@ -294,6 +339,7 @@ def admin_delete_user():
     conn = sqlite3.connect(DB_FILE)
     c = conn.cursor()
     c.execute("DELETE FROM users WHERE username=?", (username,))
+    c.execute("DELETE FROM user_devices WHERE username=?", (username,))
     conn.commit()
     conn.close()
     return jsonify({"status": "success", "message": f"用户 {username} 已永久删除"})
@@ -306,7 +352,7 @@ def admin_add_user():
     try:
         conn = sqlite3.connect(DB_FILE)
         c = conn.cursor()
-        c.execute("INSERT INTO users (username, password_hash, real_name, last_ip) VALUES (?, ?, ?, ?)", (username, hashed_password, real_name, "后台创建"))
+        c.execute("INSERT INTO users (username, password_hash, real_name, last_ip, max_devices) VALUES (?, ?, ?, ?, 1)", (username, hashed_password, real_name, "后台创建"))
         conn.commit()
         conn.close()
         return jsonify({"status": "success", "message": "添加成功！"})
