@@ -10,10 +10,7 @@ from imapclient import IMAPClient
 from flask import Flask, request, jsonify, send_file
 from werkzeug.security import generate_password_hash, check_password_hash
 
-# ==========================================================
-# 🛠️ 核心修改区 1：监听邮箱配置
-# 在这里增减负责接收验证码的飞书邮箱池
-# ==========================================================
+# ================= 🔧 核心配置区 =================
 ACCOUNTS = [
     {"email": "SBF_AI_01@superbonfire.com", "password": "3bo8gE496FeIloAm"},
     {"email": "SBF_AI_02@superbonfire.com", "password": "qjc6s8seOHInCqKo"},
@@ -22,10 +19,6 @@ ACCOUNTS = [
     {"email": "SBF_AI_05@superbonfire.com", "password": "bsIZsi0QWdD72Aib"},
 ]
 
-# ==========================================================
-# 🛠️ 核心修改区 2：AI 平台控制与限流字典
-# 如果公司买了新的 AI 平台，在这里添加它的“内部代号”和“人数上限”
-# ==========================================================
 PLATFORM_LIMITS = {
     #'seedance': 1,      
     'lovart': 2,        
@@ -35,10 +28,6 @@ PLATFORM_LIMITS = {
     'keling': 10        
 }
 
-# ==========================================================
-# 🛠️ 核心修改区 3：中英双语捕获雷达
-# 添加新平台时，在这里告诉程序要在邮件里寻找哪些中/英文触发词
-# ==========================================================
 PLATFORM_KEYWORDS = {
     #'seedance': ['seedance'],
     'lovart': ['lovart'],
@@ -48,24 +37,18 @@ PLATFORM_KEYWORDS = {
     'keling': ['keling', '可灵']
 }
 
-# ==========================================================
-# 🛠️ 核心修改区 4：数据库与安全配置
-# 可以在这里随时修改员工注册的邀请码，防止泄露
-# ==========================================================
 COMPANY_INVITE_CODE = "SBF2026"  
 DATA_DIR = "data"                
 if not os.path.exists(DATA_DIR):
     os.makedirs(DATA_DIR)
 DB_FILE = os.path.join(DATA_DIR, "ai_users.db")
 
-
-# ---------------- 以下为系统核心运行代码（非必要请勿修改） ----------------
-
 FEISHU_IMAP_SERVER = 'imap.feishu.cn'
 TARGET_PLATFORMS = list(PLATFORM_LIMITS.keys())
 EMAIL_LIST = [acc["email"] for acc in ACCOUNTS]
 
 code_storage = {platform: None for platform in TARGET_PLATFORMS}
+# 锁存储结构升级：保存字典包含过期时间和真实姓名
 lock_storage = {email_acc: {platform: {"owners": {}} for platform in TARGET_PLATFORMS} for email_acc in EMAIL_LIST}
 LOCK_DURATION = 30 * 60  
 
@@ -79,12 +62,18 @@ def init_db():
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             username TEXT UNIQUE NOT NULL,
             password_hash TEXT NOT NULL,
+            real_name TEXT NOT NULL DEFAULT '未命名',
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
     ''')
+    # 兼容老数据，尝试新增 real_name 字段
+    try:
+        c.execute("ALTER TABLE users ADD COLUMN real_name TEXT DEFAULT '未命名'")
+    except sqlite3.OperationalError:
+        pass # 如果字段已存在，就会忽略报错
     conn.commit()
     conn.close()
-    print("[*] 企业用户数据库 (SQLite3) 持久化挂载成功。")
+    print("[*] 企业用户数据库 (SQLite3) 挂载并同步完成。")
 
 init_db()
 
@@ -176,18 +165,21 @@ def monitor_single_account(email_account, app_password):
 @app.route('/api/register', methods=['POST'])
 def register_api():
     data = request.json
-    username, password, invite_code = data.get('username'), data.get('password'), data.get('invite_code')
+    username = data.get('username')
+    password = data.get('password')
+    real_name = data.get('real_name')  # 新增真实姓名
+    invite_code = data.get('invite_code')
 
     if invite_code != COMPANY_INVITE_CODE:
         return jsonify({"status": "error", "message": "企业邀请码错误！"})
-    if not username or not password:
-        return jsonify({"status": "error", "message": "账号和密码不能为空！"})
+    if not username or not password or not real_name:
+        return jsonify({"status": "error", "message": "信息填写不完整！"})
 
     hashed_password = generate_password_hash(password)
     try:
         conn = sqlite3.connect(DB_FILE)
         c = conn.cursor()
-        c.execute("INSERT INTO users (username, password_hash) VALUES (?, ?)", (username, hashed_password))
+        c.execute("INSERT INTO users (username, password_hash, real_name) VALUES (?, ?, ?)", (username, hashed_password, real_name))
         conn.commit()
         conn.close()
         return jsonify({"status": "success", "message": "注册成功！"})
@@ -201,17 +193,19 @@ def login_api():
 
     conn = sqlite3.connect(DB_FILE)
     c = conn.cursor()
-    c.execute("SELECT password_hash FROM users WHERE username=?", (username,))
+    c.execute("SELECT password_hash, real_name FROM users WHERE username=?", (username,))
     row = c.fetchone()
     conn.close()
 
     if row and check_password_hash(row[0], password):
-        return jsonify({"status": "success", "username": username})
+        return jsonify({"status": "success", "username": username, "real_name": row[1]})
     return jsonify({"status": "error", "message": "账号或密码错误！"})
 
 @app.route('/api/get_code', methods=['GET'])
 def get_code_api():
-    platform, username = request.args.get('platform'), request.args.get('username')
+    platform = request.args.get('platform')
+    username = request.args.get('username')
+    real_name = request.args.get('real_name', username)
     
     if not username:
         return jsonify({"status": "error", "message": "未提供用户身份标识！"})
@@ -221,7 +215,8 @@ def get_code_api():
     current_time = time.time()
     for email_acc in lock_storage:
         owners = lock_storage[email_acc][platform]["owners"]
-        expired_users = [u for u, t in owners.items() if current_time >= t]
+        # 数据结构变了，循环判断逻辑也要变
+        expired_users = [u for u, d in owners.items() if current_time >= d["expire"]]
         for u in expired_users: del owners[u]
 
     latest_data = code_storage.get(platform)
@@ -233,7 +228,7 @@ def get_code_api():
     lock_info = lock_storage[target_email][platform]
 
     if username not in lock_info["owners"] and len(lock_info["owners"]) >= max_users:
-        earliest_expire = min(lock_info["owners"].values())
+        earliest_expire = min([d["expire"] for d in lock_info["owners"].values()])
         remaining = int((earliest_expire - current_time) / 60) + 1
         return jsonify({
             "status": "error", 
@@ -241,7 +236,8 @@ def get_code_api():
         })
 
     code_storage[platform] = None  
-    lock_info["owners"][username] = current_time + LOCK_DURATION
+    # 记录时保存真实姓名
+    lock_info["owners"][username] = {"expire": current_time + LOCK_DURATION, "real_name": real_name}
     return jsonify({"status": "success", "code": code})
 
 @app.route('/api/get_status', methods=['GET'])
@@ -251,19 +247,18 @@ def get_status_api():
     
     for email_acc, platforms in lock_storage.items():
         for plat, info in platforms.items():
-            for user, expire_time in info["owners"].items():
-                if current_time < expire_time:
-                    remaining = int((expire_time - current_time) / 60)
+            for user, data in info["owners"].items():
+                if current_time < data["expire"]:
+                    remaining = int((data["expire"] - current_time) / 60)
                     status_report.append({
                         "email": email_acc, "platform": plat, 
-                        "user": user, "remaining_minutes": remaining
+                        "user": data["real_name"], "remaining_minutes": remaining
                     })
                     
     return jsonify({"status": "success", "data": status_report})
 
 @app.route('/api/download_db', methods=['GET'])
 def download_db_api():
-    """隐藏接口：管理员专属数据库下载通道"""
     secret = request.args.get('secret')
     if secret != COMPANY_INVITE_CODE:
         return jsonify({"status": "error", "message": "无权访问！"}), 403
