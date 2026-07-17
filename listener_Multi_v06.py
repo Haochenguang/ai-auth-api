@@ -105,9 +105,13 @@ def parse_verification_code_with_context(text, keywords):
     clean_text = html.unescape(clean_text)
     clean_text = re.sub(r'\s+', ' ', clean_text)
     clean_text_lower = clean_text.lower()
+    
     for kw in keywords:
-        match = re.search(rf"{kw}[^0-9]{{0,40}}?(?<!\d)(\d{{4,6}})(?!\d)", clean_text_lower)
+        # 使用 . 代替 [^0-9]，允许中间出现干扰数字（比如邮件里的 "10 minutes"）
+        # 只要最终的验证码是独立的 4-6 位数即可
+        match = re.search(rf"{kw}.{{0,150}}?(?<!\d)(\d{{4,6}})(?!\d)", clean_text_lower)
         if match: return match.group(1)
+        
     filtered_text = re.sub(r'(?<!\d)106\d+(?!\d)', ' ', clean_text)               
     filtered_text = re.sub(r'(?i)uid\s*[:：]?\s*\d+', ' ', filtered_text)       
     filtered_text = re.sub(r'\d{4}-\d{2}-\d{2}', ' ', filtered_text)           
