@@ -48,7 +48,6 @@ TARGET_PLATFORMS = list(PLATFORM_LIMITS.keys())
 EMAIL_LIST = [acc["email"] for acc in ACCOUNTS]
 
 code_storage = {platform: None for platform in TARGET_PLATFORMS}
-# 锁存储结构升级：保存字典包含过期时间和真实姓名
 lock_storage = {email_acc: {platform: {"owners": {}} for platform in TARGET_PLATFORMS} for email_acc in EMAIL_LIST}
 LOCK_DURATION = 30 * 60  
 
@@ -66,14 +65,13 @@ def init_db():
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
     ''')
-    # 兼容老数据，尝试新增 real_name 字段
     try:
         c.execute("ALTER TABLE users ADD COLUMN real_name TEXT DEFAULT '未命名'")
     except sqlite3.OperationalError:
-        pass # 如果字段已存在，就会忽略报错
+        pass 
     conn.commit()
     conn.close()
-    print("[*] 企业用户数据库 (SQLite3) 挂载并同步完成。")
+    print("[*] 企业用户数据库挂载并同步完成。")
 
 init_db()
 
@@ -87,8 +85,7 @@ def parse_verification_code_with_context(text, keywords):
     
     for kw in keywords:
         match = re.search(rf"{kw}[^0-9]{{0,40}}?(?<!\d)(\d{{4,6}})(?!\d)", clean_text_lower)
-        if match:
-            return match.group(1)
+        if match: return match.group(1)
             
     filtered_text = re.sub(r'(?<!\d)106\d+(?!\d)', ' ', clean_text)               
     filtered_text = re.sub(r'(?i)uid\s*[:：]?\s*\d+', ' ', filtered_text)       
@@ -159,21 +156,15 @@ def monitor_single_account(email_account, app_password):
                             server.add_flags(uid, '\\Seen')
                         server.idle()
         except Exception as e:
-            print(f"[❌ 异常] {email_account} 断线重连中... ({e})")
             time.sleep(10)
 
 @app.route('/api/register', methods=['POST'])
 def register_api():
     data = request.json
-    username = data.get('username')
-    password = data.get('password')
-    real_name = data.get('real_name')  # 新增真实姓名
-    invite_code = data.get('invite_code')
+    username, password, real_name, invite_code = data.get('username'), data.get('password'), data.get('real_name'), data.get('invite_code')
 
-    if invite_code != COMPANY_INVITE_CODE:
-        return jsonify({"status": "error", "message": "企业邀请码错误！"})
-    if not username or not password or not real_name:
-        return jsonify({"status": "error", "message": "信息填写不完整！"})
+    if invite_code != COMPANY_INVITE_CODE: return jsonify({"status": "error", "message": "企业邀请码错误！"})
+    if not username or not password or not real_name: return jsonify({"status": "error", "message": "信息填写不完整！"})
 
     hashed_password = generate_password_hash(password)
     try:
@@ -203,25 +194,20 @@ def login_api():
 
 @app.route('/api/get_code', methods=['GET'])
 def get_code_api():
-    platform = request.args.get('platform')
-    username = request.args.get('username')
-    real_name = request.args.get('real_name', username)
-    
-    if not username:
-        return jsonify({"status": "error", "message": "未提供用户身份标识！"})
-    if platform not in PLATFORM_LIMITS:
-        return jsonify({"status": "error", "message": "未知的 AI 平台！"})
+    platform, username, real_name = request.args.get('platform'), request.args.get('username'), request.args.get('real_name')
+    if not username: return jsonify({"status": "error", "message": "未提供用户身份标识！"})
+    if platform not in PLATFORM_LIMITS: return jsonify({"status": "error", "message": "未知的 AI 平台！"})
 
     current_time = time.time()
     for email_acc in lock_storage:
         owners = lock_storage[email_acc][platform]["owners"]
-        # 数据结构变了，循环判断逻辑也要变
         expired_users = [u for u, d in owners.items() if current_time >= d["expire"]]
         for u in expired_users: del owners[u]
 
     latest_data = code_storage.get(platform)
     if not latest_data:
-        return jsonify({"status": "error", "message": "未收到最新验证码，请先在 AI 平台点击发送！"})
+        # ⭐ 核心修改：改为返回 'empty' 状态，通知客户端去轮询等待
+        return jsonify({"status": "empty", "message": "未收到最新验证码"})
 
     target_email, code = latest_data["email"], latest_data["code"]
     max_users = PLATFORM_LIMITS[platform]
@@ -236,15 +222,13 @@ def get_code_api():
         })
 
     code_storage[platform] = None  
-    # 记录时保存真实姓名
-    lock_info["owners"][username] = {"expire": current_time + LOCK_DURATION, "real_name": real_name}
+    lock_info["owners"][username] = {"expire": current_time + LOCK_DURATION, "real_name": real_name or username}
     return jsonify({"status": "success", "code": code})
 
 @app.route('/api/get_status', methods=['GET'])
 def get_status_api():
     status_report = []
     current_time = time.time()
-    
     for email_acc, platforms in lock_storage.items():
         for plat, info in platforms.items():
             for user, data in info["owners"].items():
@@ -254,26 +238,17 @@ def get_status_api():
                         "email": email_acc, "platform": plat, 
                         "user": data["real_name"], "remaining_minutes": remaining
                     })
-                    
     return jsonify({"status": "success", "data": status_report})
 
 @app.route('/api/download_db', methods=['GET'])
 def download_db_api():
-    secret = request.args.get('secret')
-    if secret != COMPANY_INVITE_CODE:
-        return jsonify({"status": "error", "message": "无权访问！"}), 403
-
+    if request.args.get('secret') != COMPANY_INVITE_CODE: return jsonify({"status": "error", "message": "无权访问！"}), 403
     db_path = os.path.abspath(DB_FILE)
-    if os.path.exists(db_path):
-        return send_file(db_path, as_attachment=True, download_name="ai_users_backup.db")
-    else:
-        return jsonify({"status": "error", "message": "数据库文件还未生成！"}), 404
+    if os.path.exists(db_path): return send_file(db_path, as_attachment=True, download_name="ai_users_backup.db")
+    else: return jsonify({"status": "error", "message": "数据库文件还未生成！"}), 404
 
 if __name__ == "__main__":
-    print("==================== SUPERBONFIRE AI AUTH CENTER ====================")
     for acc in ACCOUNTS:
-        t = threading.Thread(target=monitor_single_account, args=(acc["email"], acc["password"]))
-        t.daemon = True
-        t.start()
+        t = threading.Thread(target=monitor_single_account, args=(acc["email"], acc["password"]), daemon=True).start()
         time.sleep(1)
     app.run(host='0.0.0.0', port=5000)
