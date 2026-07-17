@@ -37,10 +37,13 @@ PLATFORM_KEYWORDS = {
     'keling': ['keling', '可灵']
 }
 
-COMPANY_INVITE_CODE = "SBF2026"  
+# ⭐ 新增：超级管理员密钥（Admin 客户端登录时需要验证它，防止别人恶意调用后台接口）
+ADMIN_SECRET = "SuperAdmin2026" 
+# 默认邀请码（仅在数据库第一次初始化时使用，之后可在管理员端随意修改）
+DEFAULT_INVITE_CODE = "SBF2026" 
+
 DATA_DIR = "data"                
-if not os.path.exists(DATA_DIR):
-    os.makedirs(DATA_DIR)
+if not os.path.exists(DATA_DIR): os.makedirs(DATA_DIR)
 DB_FILE = os.path.join(DATA_DIR, "ai_users.db")
 
 FEISHU_IMAP_SERVER = 'imap.feishu.cn'
@@ -53,28 +56,42 @@ LOCK_DURATION = 30 * 60
 
 app = Flask(__name__)
 
+# 获取真实IP防代理穿透助手函数
+def get_client_ip():
+    return request.headers.get('X-Forwarded-For', request.remote_addr).split(',')[0].strip()
+
+# ================= 🛡️ 数据库初始化与热升级 =================
 def init_db():
     conn = sqlite3.connect(DB_FILE)
     c = conn.cursor()
+    # 用户表
     c.execute('''
         CREATE TABLE IF NOT EXISTS users (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             username TEXT UNIQUE NOT NULL,
             password_hash TEXT NOT NULL,
             real_name TEXT NOT NULL DEFAULT '未命名',
+            last_ip TEXT DEFAULT '未知',
+            is_locked INTEGER DEFAULT 0,
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
     ''')
-    try:
-        c.execute("ALTER TABLE users ADD COLUMN real_name TEXT DEFAULT '未命名'")
-    except sqlite3.OperationalError:
-        pass 
+    # 热升级老数据库结构
+    for col, definition in [('real_name', "TEXT DEFAULT '未命名'"), ('last_ip', "TEXT DEFAULT '未知'"), ('is_locked', "INTEGER DEFAULT 0")]:
+        try: c.execute(f"ALTER TABLE users ADD COLUMN {col} {definition}")
+        except sqlite3.OperationalError: pass 
+        
+    # 系统设置表（用于动态存储邀请码等）
+    c.execute('''CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT)''')
+    c.execute("INSERT OR IGNORE INTO settings (key, value) VALUES ('invite_code', ?)", (DEFAULT_INVITE_CODE,))
+    
     conn.commit()
     conn.close()
-    print("[*] 企业用户数据库挂载并同步完成。")
+    print("[*] 数据库热升级成功，支持 IP 追踪、封号与动态配置。")
 
 init_db()
 
+# 验证码解析引擎保持不变
 def parse_verification_code_with_context(text, keywords):
     clean_text = re.sub(r'<style.*?>.*?</style>', ' ', text, flags=re.IGNORECASE|re.DOTALL)
     clean_text = re.sub(r'<script.*?>.*?</script>', ' ', clean_text, flags=re.IGNORECASE|re.DOTALL)
@@ -82,17 +99,14 @@ def parse_verification_code_with_context(text, keywords):
     clean_text = html.unescape(clean_text)
     clean_text = re.sub(r'\s+', ' ', clean_text)
     clean_text_lower = clean_text.lower()
-    
     for kw in keywords:
         match = re.search(rf"{kw}[^0-9]{{0,40}}?(?<!\d)(\d{{4,6}})(?!\d)", clean_text_lower)
         if match: return match.group(1)
-            
     filtered_text = re.sub(r'(?<!\d)106\d+(?!\d)', ' ', clean_text)               
     filtered_text = re.sub(r'(?i)uid\s*[:：]?\s*\d+', ' ', filtered_text)       
     filtered_text = re.sub(r'\d{4}-\d{2}-\d{2}', ' ', filtered_text)           
     filtered_text = re.sub(r'\d{2}:\d{2}(:\d{2})?', ' ', filtered_text)         
     filtered_text = re.sub(r'(?i)(copyright|©)\s*\d{4}', ' ', filtered_text)
-
     match = re.search(r'(?<!\d)\d{4,6}(?!\d)', filtered_text)
     return match.group(0) if match else None
 
@@ -113,17 +127,13 @@ def monitor_single_account(email_account, app_password):
                             msg = email.message_from_bytes(message_data[b'RFC822'])
                             sender = msg.get("From", "").lower()
                             subject = msg.get("Subject", "")
-                            
                             try:
                                 decoded_subject = ""
                                 for part, encoding in decode_header(subject):
-                                    if isinstance(part, bytes):
-                                        decoded_subject += part.decode(encoding or 'utf-8', errors='ignore')
-                                    else:
-                                        decoded_subject += part
+                                    if isinstance(part, bytes): decoded_subject += part.decode(encoding or 'utf-8', errors='ignore')
+                                    else: decoded_subject += part
                                 subject_str = decoded_subject.lower()
-                            except Exception:
-                                subject_str = str(subject).lower()
+                            except: subject_str = str(subject).lower()
 
                             body = ""
                             if msg.is_multipart():
@@ -136,41 +146,35 @@ def monitor_single_account(email_account, app_password):
                                 if payload: body = payload.decode(errors='ignore')
                             
                             full_text = subject_str + " \n " + body
-                            full_text_lower = full_text.lower()
-
                             for platform in TARGET_PLATFORMS:
                                 keywords = PLATFORM_KEYWORDS.get(platform, [platform])
-                                
-                                platform_matched = False
-                                for kw in keywords:
-                                    if kw in sender or kw in full_text_lower:
-                                        platform_matched = True
-                                        break
-                                
-                                if platform_matched:
+                                if any(kw in sender or kw in full_text.lower() for kw in keywords):
                                     code = parse_verification_code_with_context(full_text, keywords)
                                     if code:
-                                        print(f"【💥 捕获验证码】邮箱: {email_account} | 平台: {platform} | 码: {code}")
+                                        print(f"【💥 捕获】{email_account} | {platform} | {code}")
                                         code_storage[platform] = {"code": code, "email": email_account}
-                                        
                             server.add_flags(uid, '\\Seen')
                         server.idle()
-        except Exception as e:
-            time.sleep(10)
+        except Exception: time.sleep(10)
 
+# ================= 🔌 普通客户端 API =================
 @app.route('/api/register', methods=['POST'])
 def register_api():
     data = request.json
     username, password, real_name, invite_code = data.get('username'), data.get('password'), data.get('real_name'), data.get('invite_code')
+    client_ip = get_client_ip()
 
-    if invite_code != COMPANY_INVITE_CODE: return jsonify({"status": "error", "message": "企业邀请码错误！"})
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    c.execute("SELECT value FROM settings WHERE key='invite_code'")
+    current_invite = c.fetchone()[0]
+
+    if invite_code != current_invite: return jsonify({"status": "error", "message": "企业邀请码错误或已失效！"})
     if not username or not password or not real_name: return jsonify({"status": "error", "message": "信息填写不完整！"})
 
     hashed_password = generate_password_hash(password)
     try:
-        conn = sqlite3.connect(DB_FILE)
-        c = conn.cursor()
-        c.execute("INSERT INTO users (username, password_hash, real_name) VALUES (?, ?, ?)", (username, hashed_password, real_name))
+        c.execute("INSERT INTO users (username, password_hash, real_name, last_ip) VALUES (?, ?, ?, ?)", (username, hashed_password, real_name, client_ip))
         conn.commit()
         conn.close()
         return jsonify({"status": "success", "message": "注册成功！"})
@@ -181,22 +185,40 @@ def register_api():
 def login_api():
     data = request.json
     username, password = data.get('username'), data.get('password')
+    client_ip = get_client_ip()
 
     conn = sqlite3.connect(DB_FILE)
     c = conn.cursor()
-    c.execute("SELECT password_hash, real_name FROM users WHERE username=?", (username,))
+    c.execute("SELECT password_hash, real_name, is_locked FROM users WHERE username=?", (username,))
     row = c.fetchone()
-    conn.close()
-
+    
     if row and check_password_hash(row[0], password):
+        if row[2] == 1: # 账号被管理员锁定
+            return jsonify({"status": "error", "message": "账号已被管理员锁定，禁止登录！"})
+        
+        # 记录本次登录 IP
+        c.execute("UPDATE users SET last_ip=? WHERE username=?", (client_ip, username))
+        conn.commit()
+        conn.close()
         return jsonify({"status": "success", "username": username, "real_name": row[1]})
+        
+    conn.close()
     return jsonify({"status": "error", "message": "账号或密码错误！"})
 
 @app.route('/api/get_code', methods=['GET'])
 def get_code_api():
     platform, username, real_name = request.args.get('platform'), request.args.get('username'), request.args.get('real_name')
-    if not username: return jsonify({"status": "error", "message": "未提供用户身份标识！"})
+    if not username: return jsonify({"status": "error", "message": "未提供身份标识！"})
     if platform not in PLATFORM_LIMITS: return jsonify({"status": "error", "message": "未知的 AI 平台！"})
+
+    # 验证账号是否被实时踢出
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    c.execute("SELECT is_locked FROM users WHERE username=?", (username,))
+    lock_status = c.fetchone()
+    conn.close()
+    if not lock_status or lock_status[0] == 1:
+        return jsonify({"status": "error", "message": "您的账号已被管理员冻结，请求拦截！"})
 
     current_time = time.time()
     for email_acc in lock_storage:
@@ -205,9 +227,7 @@ def get_code_api():
         for u in expired_users: del owners[u]
 
     latest_data = code_storage.get(platform)
-    if not latest_data:
-        # ⭐ 核心修改：改为返回 'empty' 状态，通知客户端去轮询等待
-        return jsonify({"status": "empty", "message": "未收到最新验证码"})
+    if not latest_data: return jsonify({"status": "empty", "message": "未收到最新验证码"})
 
     target_email, code = latest_data["email"], latest_data["code"]
     max_users = PLATFORM_LIMITS[platform]
@@ -216,10 +236,7 @@ def get_code_api():
     if username not in lock_info["owners"] and len(lock_info["owners"]) >= max_users:
         earliest_expire = min([d["expire"] for d in lock_info["owners"].values()])
         remaining = int((earliest_expire - current_time) / 60) + 1
-        return jsonify({
-            "status": "error", 
-            "message": f"({target_email}) 已满员！请换邮箱或等待 {remaining} 分钟。"
-        })
+        return jsonify({"status": "error", "message": f"({target_email}) 已满员！请等待 {remaining} 分钟。"})
 
     code_storage[platform] = None  
     lock_info["owners"][username] = {"expire": current_time + LOCK_DURATION, "real_name": real_name or username}
@@ -233,22 +250,88 @@ def get_status_api():
         for plat, info in platforms.items():
             for user, data in info["owners"].items():
                 if current_time < data["expire"]:
-                    remaining = int((data["expire"] - current_time) / 60)
                     status_report.append({
                         "email": email_acc, "platform": plat, 
-                        "user": data["real_name"], "remaining_minutes": remaining
+                        "user": data["real_name"], "remaining_minutes": int((data["expire"] - current_time) / 60)
                     })
     return jsonify({"status": "success", "data": status_report})
 
-@app.route('/api/download_db', methods=['GET'])
-def download_db_api():
-    if request.args.get('secret') != COMPANY_INVITE_CODE: return jsonify({"status": "error", "message": "无权访问！"}), 403
-    db_path = os.path.abspath(DB_FILE)
-    if os.path.exists(db_path): return send_file(db_path, as_attachment=True, download_name="ai_users_backup.db")
-    else: return jsonify({"status": "error", "message": "数据库文件还未生成！"}), 404
+
+# ================= 🛡️ 超级管理员专属 API 接口区 =================
+
+# 权限拦截装饰器替代方案：检查 Admin Secret
+def check_admin(data):
+    return data.get('admin_secret') == ADMIN_SECRET
+
+@app.route('/api/admin/users', methods=['POST'])
+def admin_get_users():
+    if not check_admin(request.json): return jsonify({"status": "error", "message": "权限拒绝"}), 403
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    c.execute("SELECT id, username, real_name, last_ip, is_locked, created_at FROM users")
+    users = [{"id": r[0], "username": r[1], "real_name": r[2], "last_ip": r[3], "is_locked": bool(r[4]), "created_at": r[5]} for r in c.fetchall()]
+    conn.close()
+    return jsonify({"status": "success", "data": users})
+
+@app.route('/api/admin/user/toggle_lock', methods=['POST'])
+def admin_toggle_lock():
+    if not check_admin(request.json): return jsonify({"status": "error", "message": "权限拒绝"}), 403
+    username = request.json.get('username')
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    c.execute("SELECT is_locked FROM users WHERE username=?", (username,))
+    current_status = c.fetchone()[0]
+    new_status = 0 if current_status == 1 else 1
+    c.execute("UPDATE users SET is_locked=? WHERE username=?", (new_status, username))
+    conn.commit()
+    conn.close()
+    return jsonify({"status": "success", "message": f"用户 {username} 已{'锁定' if new_status else '解锁'}"})
+
+@app.route('/api/admin/user/delete', methods=['POST'])
+def admin_delete_user():
+    if not check_admin(request.json): return jsonify({"status": "error", "message": "权限拒绝"}), 403
+    username = request.json.get('username')
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    c.execute("DELETE FROM users WHERE username=?", (username,))
+    conn.commit()
+    conn.close()
+    return jsonify({"status": "success", "message": f"用户 {username} 已永久删除"})
+
+@app.route('/api/admin/user/add', methods=['POST'])
+def admin_add_user():
+    if not check_admin(request.json): return jsonify({"status": "error", "message": "权限拒绝"}), 403
+    username, password, real_name = request.json.get('username'), request.json.get('password'), request.json.get('real_name')
+    hashed_password = generate_password_hash(password)
+    try:
+        conn = sqlite3.connect(DB_FILE)
+        c = conn.cursor()
+        c.execute("INSERT INTO users (username, password_hash, real_name, last_ip) VALUES (?, ?, ?, ?)", (username, hashed_password, real_name, "后台创建"))
+        conn.commit()
+        conn.close()
+        return jsonify({"status": "success", "message": "添加成功！"})
+    except sqlite3.IntegrityError:
+        return jsonify({"status": "error", "message": "用户名已存在！"})
+
+@app.route('/api/admin/settings', methods=['POST'])
+def admin_get_set_settings():
+    if not check_admin(request.json): return jsonify({"status": "error", "message": "权限拒绝"}), 403
+    new_code = request.json.get('new_invite_code')
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    if new_code:
+        c.execute("UPDATE settings SET value=? WHERE key='invite_code'", (new_code,))
+        conn.commit()
+        msg = f"邀请码已修改为: {new_code}"
+    else:
+        msg = "获取成功"
+    c.execute("SELECT value FROM settings WHERE key='invite_code'")
+    current_code = c.fetchone()[0]
+    conn.close()
+    return jsonify({"status": "success", "message": msg, "invite_code": current_code})
 
 if __name__ == "__main__":
     for acc in ACCOUNTS:
-        t = threading.Thread(target=monitor_single_account, args=(acc["email"], acc["password"]), daemon=True).start()
+        threading.Thread(target=monitor_single_account, args=(acc["email"], acc["password"]), daemon=True).start()
         time.sleep(1)
     app.run(host='0.0.0.0', port=5000)
