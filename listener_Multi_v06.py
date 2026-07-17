@@ -1,15 +1,19 @@
+import os
 import time
 import re
 import email
 from email.header import decode_header
 import threading
-import html  # ⭐ 新增：专门用于解析和卸妆网页邮件的官方利器
+import html
+import sqlite3
 from imapclient import IMAPClient
-from flask import Flask, request, jsonify
+from flask import Flask, request, jsonify, send_file
+from werkzeug.security import generate_password_hash, check_password_hash
 
-# ================= 🔧 配置区 =================
-FEISHU_IMAP_SERVER = 'imap.feishu.cn'
-
+# ==========================================================
+# 🛠️ 核心修改区 1：监听邮箱配置
+# 在这里增减负责接收验证码的飞书邮箱池
+# ==========================================================
 ACCOUNTS = [
     {"email": "SBF_AI_01@superbonfire.com", "password": "3bo8gE496FeIloAm"},
     {"email": "SBF_AI_02@superbonfire.com", "password": "qjc6s8seOHInCqKo"},
@@ -18,6 +22,10 @@ ACCOUNTS = [
     {"email": "SBF_AI_05@superbonfire.com", "password": "bsIZsi0QWdD72Aib"},
 ]
 
+# ==========================================================
+# 🛠️ 核心修改区 2：AI 平台控制与限流字典
+# 如果公司买了新的 AI 平台，在这里添加它的“内部代号”和“人数上限”
+# ==========================================================
 PLATFORM_LIMITS = {
     #'seedance': 1,      
     'lovart': 2,        
@@ -27,6 +35,10 @@ PLATFORM_LIMITS = {
     'keling': 10        
 }
 
+# ==========================================================
+# 🛠️ 核心修改区 3：中英双语捕获雷达
+# 添加新平台时，在这里告诉程序要在邮件里寻找哪些中/英文触发词
+# ==========================================================
 PLATFORM_KEYWORDS = {
     #'seedance': ['seedance'],
     'lovart': ['lovart'],
@@ -35,52 +47,66 @@ PLATFORM_KEYWORDS = {
     'jimeng': ['jimeng', '即梦'],
     'keling': ['keling', '可灵']
 }
-# ============================================
 
+# ==========================================================
+# 🛠️ 核心修改区 4：数据库与安全配置
+# 可以在这里随时修改员工注册的邀请码，防止泄露
+# ==========================================================
+COMPANY_INVITE_CODE = "SBF2026"  
+DATA_DIR = "data"                
+if not os.path.exists(DATA_DIR):
+    os.makedirs(DATA_DIR)
+DB_FILE = os.path.join(DATA_DIR, "ai_users.db")
+
+
+# ---------------- 以下为系统核心运行代码（非必要请勿修改） ----------------
+
+FEISHU_IMAP_SERVER = 'imap.feishu.cn'
 TARGET_PLATFORMS = list(PLATFORM_LIMITS.keys())
 EMAIL_LIST = [acc["email"] for acc in ACCOUNTS]
 
 code_storage = {platform: None for platform in TARGET_PLATFORMS}
 lock_storage = {email_acc: {platform: {"owners": {}} for platform in TARGET_PLATFORMS} for email_acc in EMAIL_LIST}
-
 LOCK_DURATION = 30 * 60  
 
 app = Flask(__name__)
 
+def init_db():
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    c.execute('''
+        CREATE TABLE IF NOT EXISTS users (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            username TEXT UNIQUE NOT NULL,
+            password_hash TEXT NOT NULL,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    ''')
+    conn.commit()
+    conn.close()
+    print("[*] 企业用户数据库 (SQLite3) 持久化挂载成功。")
+
+init_db()
+
 def parse_verification_code_with_context(text, keywords):
-    """
-    智能解析验证码：先卸妆，再搜索。完美免疫 HTML 邮件中的 CSS/色号 干扰！
-    """
-    # --- 1. 终极 HTML 卸妆术 ---
-    # 删掉 CSS 和 JS 块，屏蔽所有诸如 #333333 这种隐藏颜色代码
     clean_text = re.sub(r'<style.*?>.*?</style>', ' ', text, flags=re.IGNORECASE|re.DOTALL)
     clean_text = re.sub(r'<script.*?>.*?</script>', ' ', clean_text, flags=re.IGNORECASE|re.DOTALL)
-    
-    # 扒掉所有 HTML 标签 (<...>)
     clean_text = re.sub(r'<[^>]+>', ' ', clean_text)
-    
-    # 将网页转义符（如 &nbsp;）翻译成真实文字
     clean_text = html.unescape(clean_text)
-    
-    # 把文本彻底展平（将多个换行和空格压缩成一个空格）
     clean_text = re.sub(r'\s+', ' ', clean_text)
     clean_text_lower = clean_text.lower()
     
-    # --- 2. 匹配逻辑 ---
     for kw in keywords:
         match = re.search(rf"{kw}[^0-9]{{0,40}}?(?<!\d)(\d{{4,6}})(?!\d)", clean_text_lower)
         if match:
             return match.group(1)
             
-    # --- 3. 强力净化区（排雷） ---
     filtered_text = re.sub(r'(?<!\d)106\d+(?!\d)', ' ', clean_text)               
     filtered_text = re.sub(r'(?i)uid\s*[:：]?\s*\d+', ' ', filtered_text)       
     filtered_text = re.sub(r'\d{4}-\d{2}-\d{2}', ' ', filtered_text)           
     filtered_text = re.sub(r'\d{2}:\d{2}(:\d{2})?', ' ', filtered_text)         
-    # 顺手过滤掉邮件底部的版权年份声明 (如 © 2024, 2026)，防止误抓
     filtered_text = re.sub(r'(?i)(copyright|©)\s*\d{4}', ' ', filtered_text)
 
-    # --- 4. 兜底寻找真正的验证码 ---
     match = re.search(r'(?<!\d)\d{4,6}(?!\d)', filtered_text)
     return match.group(0) if match else None
 
@@ -144,53 +170,112 @@ def monitor_single_account(email_account, app_password):
                             server.add_flags(uid, '\\Seen')
                         server.idle()
         except Exception as e:
-            print(f"[❌ 异常] 邮箱 {email_account} 监听中断，原因: {e}。10秒后重试...")
+            print(f"[❌ 异常] {email_account} 断线重连中... ({e})")
             time.sleep(10)
+
+@app.route('/api/register', methods=['POST'])
+def register_api():
+    data = request.json
+    username, password, invite_code = data.get('username'), data.get('password'), data.get('invite_code')
+
+    if invite_code != COMPANY_INVITE_CODE:
+        return jsonify({"status": "error", "message": "企业邀请码错误！"})
+    if not username or not password:
+        return jsonify({"status": "error", "message": "账号和密码不能为空！"})
+
+    hashed_password = generate_password_hash(password)
+    try:
+        conn = sqlite3.connect(DB_FILE)
+        c = conn.cursor()
+        c.execute("INSERT INTO users (username, password_hash) VALUES (?, ?)", (username, hashed_password))
+        conn.commit()
+        conn.close()
+        return jsonify({"status": "success", "message": "注册成功！"})
+    except sqlite3.IntegrityError:
+        return jsonify({"status": "error", "message": "用户名已存在！"})
+
+@app.route('/api/login', methods=['POST'])
+def login_api():
+    data = request.json
+    username, password = data.get('username'), data.get('password')
+
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    c.execute("SELECT password_hash FROM users WHERE username=?", (username,))
+    row = c.fetchone()
+    conn.close()
+
+    if row and check_password_hash(row[0], password):
+        return jsonify({"status": "success", "username": username})
+    return jsonify({"status": "error", "message": "账号或密码错误！"})
 
 @app.route('/api/get_code', methods=['GET'])
 def get_code_api():
-    platform = request.args.get('platform')
-    mac = request.args.get('mac')
+    platform, username = request.args.get('platform'), request.args.get('username')
     
-    if not mac:
-        return jsonify({"status": "error", "message": "非法的设备！"})
+    if not username:
+        return jsonify({"status": "error", "message": "未提供用户身份标识！"})
     if platform not in PLATFORM_LIMITS:
         return jsonify({"status": "error", "message": "未知的 AI 平台！"})
 
     current_time = time.time()
-    
     for email_acc in lock_storage:
         owners = lock_storage[email_acc][platform]["owners"]
-        expired_macs = [m for m, t in owners.items() if current_time >= t]
-        for m in expired_macs:
-            del owners[m]
+        expired_users = [u for u, t in owners.items() if current_time >= t]
+        for u in expired_users: del owners[u]
 
     latest_data = code_storage.get(platform)
     if not latest_data:
         return jsonify({"status": "error", "message": "未收到最新验证码，请先在 AI 平台点击发送！"})
 
-    target_email = latest_data["email"]
-    code = latest_data["code"]
-    max_users_allowed = PLATFORM_LIMITS[platform]
-    
+    target_email, code = latest_data["email"], latest_data["code"]
+    max_users = PLATFORM_LIMITS[platform]
     lock_info = lock_storage[target_email][platform]
 
-    if mac not in lock_info["owners"] and len(lock_info["owners"]) >= max_users_allowed:
+    if username not in lock_info["owners"] and len(lock_info["owners"]) >= max_users:
         earliest_expire = min(lock_info["owners"].values())
-        remaining_minutes = int((earliest_expire - current_time) / 60) + 1
+        remaining = int((earliest_expire - current_time) / 60) + 1
         return jsonify({
             "status": "error", 
-            "message": f"当前账号 ({target_email}) 已有 {max_users_allowed} 人使用，名额已满！\n(请换一个没人用的公司邮箱账号发送验证码，\n或等待 {remaining_minutes} 分钟)。"
+            "message": f"({target_email}) 已满员！请换邮箱或等待 {remaining} 分钟。"
         })
 
     code_storage[platform] = None  
-    lock_info["owners"][mac] = current_time + LOCK_DURATION
-    current_occupancy = len(lock_info["owners"])
-    
+    lock_info["owners"][username] = current_time + LOCK_DURATION
     return jsonify({"status": "success", "code": code})
 
+@app.route('/api/get_status', methods=['GET'])
+def get_status_api():
+    status_report = []
+    current_time = time.time()
+    
+    for email_acc, platforms in lock_storage.items():
+        for plat, info in platforms.items():
+            for user, expire_time in info["owners"].items():
+                if current_time < expire_time:
+                    remaining = int((expire_time - current_time) / 60)
+                    status_report.append({
+                        "email": email_acc, "platform": plat, 
+                        "user": user, "remaining_minutes": remaining
+                    })
+                    
+    return jsonify({"status": "success", "data": status_report})
+
+@app.route('/api/download_db', methods=['GET'])
+def download_db_api():
+    """隐藏接口：管理员专属数据库下载通道"""
+    secret = request.args.get('secret')
+    if secret != COMPANY_INVITE_CODE:
+        return jsonify({"status": "error", "message": "无权访问！"}), 403
+
+    db_path = os.path.abspath(DB_FILE)
+    if os.path.exists(db_path):
+        return send_file(db_path, as_attachment=True, download_name="ai_users_backup.db")
+    else:
+        return jsonify({"status": "error", "message": "数据库文件还未生成！"}), 404
+
 if __name__ == "__main__":
-    print("==================== 安全验证中心 (卸妆抗干扰版) ====================")
+    print("==================== SUPERBONFIRE AI AUTH CENTER ====================")
     for acc in ACCOUNTS:
         t = threading.Thread(target=monitor_single_account, args=(acc["email"], acc["password"]))
         t.daemon = True
