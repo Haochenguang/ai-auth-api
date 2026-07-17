@@ -40,7 +40,7 @@ PLATFORM_KEYWORDS = {
 # ⭐ 新增：超级管理员密钥（Admin 客户端登录时需要验证它，防止别人恶意调用后台接口）
 ADMIN_SECRET = "SuperAdmin2026" 
 # 默认邀请码（仅在数据库第一次初始化时使用，之后可在管理员端随意修改）
-DEFAULT_INVITE_CODE = "SBF2026" 
+DEFAULT_INVITE_CODE = "SBF2026"  
 
 DATA_DIR = "data"                
 if not os.path.exists(DATA_DIR): os.makedirs(DATA_DIR)
@@ -75,15 +75,15 @@ def init_db():
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
     ''')
-    # 热升级老数据库结构
     for col, definition in [('real_name', "TEXT DEFAULT '未命名'"), ('last_ip', "TEXT DEFAULT '未知'"), ('is_locked', "INTEGER DEFAULT 0"), ('max_devices', "INTEGER DEFAULT 1")]:
         try: c.execute(f"ALTER TABLE users ADD COLUMN {col} {definition}")
         except sqlite3.OperationalError: pass 
         
     c.execute('''CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT)''')
     c.execute("INSERT OR IGNORE INTO settings (key, value) VALUES ('invite_code', ?)", (DEFAULT_INVITE_CODE,))
+    # ⭐ 新增：设备校验全局总开关，默认开启 ('1')
+    c.execute("INSERT OR IGNORE INTO settings (key, value) VALUES ('check_machine_code', '1')")
     
-    # ⭐ 新增：设备绑定记录表
     c.execute('''
         CREATE TABLE IF NOT EXISTS user_devices (
             username TEXT,
@@ -94,7 +94,7 @@ def init_db():
     
     conn.commit()
     conn.close()
-    print("[*] 数据库热升级成功，已支持机器码设备绑定功能。")
+    print("[*] 数据库热升级成功，支持机器码全局开关控制。")
 
 init_db()
 
@@ -191,10 +191,8 @@ def register_api():
 def login_api():
     data = request.json
     username, password = data.get('username'), data.get('password')
-    machine_code = data.get('machine_code') # ⭐ 获取机器码
+    machine_code = data.get('machine_code')
     client_ip = get_client_ip()
-
-    if not machine_code: return jsonify({"status": "error", "message": "环境异常：无法获取设备物理网卡地址！"})
 
     conn = sqlite3.connect(DB_FILE)
     c = conn.cursor()
@@ -205,18 +203,23 @@ def login_api():
         if row[2] == 1: 
             return jsonify({"status": "error", "message": "账号已被管理员锁定，禁止登录！"})
         
-        max_dev = row[3]
+        # ⭐ 获取全局机器码校验开关
+        c.execute("SELECT value FROM settings WHERE key='check_machine_code'")
+        check_machine_status = c.fetchone()
+        check_machine_code = True if not check_machine_status else (check_machine_status[0] == '1')
         
-        # ⭐ 核心设备绑定与校验逻辑
-        c.execute("SELECT machine_code FROM user_devices WHERE username=?", (username,))
-        bound_devices = [r[0] for r in c.fetchall()]
-        
-        if machine_code not in bound_devices:
-            if len(bound_devices) >= max_dev:
-                conn.close()
-                return jsonify({"status": "error", "message": f"登录被拒绝：该账号绑定的电脑数量已达上限 ({max_dev}台)。\n请在原办公电脑使用，或联系管理员解绑！"})
-            else:
-                c.execute("INSERT INTO user_devices (username, machine_code) VALUES (?, ?)", (username, machine_code))
+        if check_machine_code:
+            if not machine_code: return jsonify({"status": "error", "message": "环境异常：无法获取设备物理网卡地址！"})
+            max_dev = row[3]
+            c.execute("SELECT machine_code FROM user_devices WHERE username=?", (username,))
+            bound_devices = [r[0] for r in c.fetchall()]
+            
+            if machine_code not in bound_devices:
+                if len(bound_devices) >= max_dev:
+                    conn.close()
+                    return jsonify({"status": "error", "message": f"登录被拒绝：该账号绑定的电脑数量已达上限 ({max_dev}台)。\n请在原办公电脑使用，或联系管理员解绑！"})
+                else:
+                    c.execute("INSERT INTO user_devices (username, machine_code) VALUES (?, ?)", (username, machine_code))
         
         c.execute("UPDATE users SET last_ip=? WHERE username=?", (client_ip, username))
         conn.commit()
@@ -286,7 +289,6 @@ def admin_get_users():
     if not check_admin(request.json): return jsonify({"status": "error", "message": "权限拒绝"}), 403
     conn = sqlite3.connect(DB_FILE)
     c = conn.cursor()
-    # 连表查询统计已绑定设备数量
     c.execute("""
         SELECT u.id, u.username, u.real_name, u.last_ip, u.is_locked, u.created_at, u.max_devices, 
                (SELECT COUNT(*) FROM user_devices WHERE username=u.username) as bound_count 
@@ -362,19 +364,35 @@ def admin_add_user():
 @app.route('/api/admin/settings', methods=['POST'])
 def admin_get_set_settings():
     if not check_admin(request.json): return jsonify({"status": "error", "message": "权限拒绝"}), 403
-    new_code = request.json.get('new_invite_code')
+    
+    new_invite = request.json.get('new_invite_code')
+    new_check_machine = request.json.get('check_machine_code') # '1' 或 '0'
+    
     conn = sqlite3.connect(DB_FILE)
     c = conn.cursor()
-    if new_code:
-        c.execute("UPDATE settings SET value=? WHERE key='invite_code'", (new_code,))
-        conn.commit()
-        msg = f"邀请码已修改为: {new_code}"
-    else:
-        msg = "获取成功"
+    
+    msg = []
+    if new_invite:
+        c.execute("UPDATE settings SET value=? WHERE key='invite_code'", (new_invite,))
+        msg.append(f"邀请码已修改为: {new_invite}")
+    
+    if new_check_machine is not None:
+        c.execute("UPDATE settings SET value=? WHERE key='check_machine_code'", (str(new_check_machine),))
+        status_text = "开启" if new_check_machine == '1' else "关闭"
+        msg.append(f"设备码校验功能已: {status_text}")
+        
+    if msg: conn.commit()
+    
     c.execute("SELECT value FROM settings WHERE key='invite_code'")
-    current_code = c.fetchone()[0]
+    current_invite = c.fetchone()
+    current_invite = current_invite[0] if current_invite else DEFAULT_INVITE_CODE
+    
+    c.execute("SELECT value FROM settings WHERE key='check_machine_code'")
+    current_machine = c.fetchone()
+    current_machine = current_machine[0] if current_machine else '1'
+    
     conn.close()
-    return jsonify({"status": "success", "message": msg, "invite_code": current_code})
+    return jsonify({"status": "success", "message": " | ".join(msg) if msg else "获取成功", "invite_code": current_invite, "check_machine_code": current_machine})
 
 if __name__ == "__main__":
     for acc in ACCOUNTS:
