@@ -9,8 +9,6 @@ import sqlite3
 from imapclient import IMAPClient
 from flask import Flask, request, jsonify, send_file
 from werkzeug.security import generate_password_hash, check_password_hash
-# ⭐ 新增时间解析库，用于把邮件的发送时间转换为时间戳
-from email.utils import parsedate_to_datetime 
 
 # ================= 🔧 核心配置区 =================
 ACCOUNTS = [
@@ -102,7 +100,6 @@ def parse_verification_code_with_context(text, keywords):
     clean_text_lower = clean_text.lower()
     
     for kw in keywords:
-        # ⭐ 正则修复：使用 . 代替 [^0-9]，允许关键字和验证码之间出现其他数字（如 10 minutes）
         match = re.search(rf"{kw}.{{0,150}}?(?<!\d)(\d{{4,6}})(?!\d)", clean_text_lower)
         if match: return match.group(1)
         
@@ -116,7 +113,6 @@ def parse_verification_code_with_context(text, keywords):
 
 # ================= 📧 核心监听与去重提取引擎 =================
 def monitor_single_account(email_account, app_password):
-    # 【指纹记忆库】：放置在断线重连循环的外侧，保证只要服务器不重启，记录就不会丢失
     processed_uids = set() 
     
     while True:
@@ -125,6 +121,13 @@ def monitor_single_account(email_account, app_password):
                 server.login(email_account, app_password)
                 server.select_folder('INBOX')
                 print(f"[✔] 邮箱 {email_account} 开始监听...")
+                
+                # 🚀 【核心机制】：启动时，将现有的历史邮件强行拉入黑名单！
+                # 这样重启脚本时，绝对不会把邮箱里的旧邮件当成新邮件去提取。
+                existing_messages = server.search('ALL')
+                if existing_messages:
+                    processed_uids.update(existing_messages[-20:]) # 屏蔽最近的20封历史邮件
+                
                 server.idle()
                 
                 while True:
@@ -132,47 +135,20 @@ def monitor_single_account(email_account, app_password):
                     if responses:
                         server.idle_done() 
                         
-                        # 1. 暴力拉取：不再区分是否已读，直接索要收件箱里的所有邮件 UID 列表
                         messages = server.search('ALL')
-                        
-                        # 2. 性能切片：为了防止箱内邮件太多卡死，我们永远只取最后（最新）的 5 封邮件进行比对
                         recent_messages = messages[-5:] if len(messages) >= 5 else messages
                         
-                        # 3. 开始遍历这最新的 5 封邮件
                         for uid in recent_messages:
-                            
-                            # 🚨 【防线一：UID 指纹锁】
-                            # 如果这封邮件的 UID 存在于记忆库中，说明已经处理过了，直接略过
+                            # 🚨 防线一：UID 指纹锁（彻底删除了那个惹祸的时间锁）
                             if uid in processed_uids:
                                 continue 
                             
-                            # 没处理过的话，立刻将其加入记忆库，打上“已处理”烙印
                             processed_uids.add(uid)
                             
-                            # 下载这封邮件的全部数据
                             message_data = server.fetch([uid], 'RFC822')
                             for _, data in message_data.items():
                                 msg = email.message_from_bytes(data[b'RFC822'])
                                 
-                                # 🚨 【防线二：时间戳保鲜锁】
-                                msg_date = msg.get("Date") # 获取邮件信封上的原始发送时间
-                                if msg_date:
-                                    try:
-                                        # 将字符串时间转换为 Python 的时间戳数字
-                                        dt = parsedate_to_datetime(msg_date)
-                                        # 计算“现在的时间”减去“邮件发出的时间”，得到秒数差
-                                        time_diff = time.time() - dt.timestamp()
-                                        
-                                        # ⚠️ 修改区：这里的 180 代表 180 秒（3分钟）。
-                                        # 如果以后你只想抓取 1 分钟内的邮件，请把这里的 180 改成 60。
-                                        if time_diff > 120:
-                                            continue # 如果这封信已经超过 3 分钟，视为过期垃圾，直接跳过
-                                    except Exception:
-                                        pass # 如果时间解析出错，不报错，继续往下走，靠 UID 锁兜底
-                                
-                                # ---- 如果通过了上面的两道锁，说明这是一封“纯正的新鲜邮件” ----
-                                
-                                # 解析发件人和主题
                                 sender = msg.get("From", "").lower()
                                 subject = msg.get("Subject", "")
                                 try:
@@ -183,7 +159,6 @@ def monitor_single_account(email_account, app_password):
                                     subject_str = decoded_subject.lower()
                                 except: subject_str = str(subject).lower()
 
-                                # 解析邮件正文
                                 body = ""
                                 if msg.is_multipart():
                                     for part in msg.walk():
@@ -194,20 +169,22 @@ def monitor_single_account(email_account, app_password):
                                     payload = msg.get_payload(decode=True)
                                     if payload: body = payload.decode(errors='ignore')
                                 
-                                # 将主题和正文合并，准备提款
                                 full_text = subject_str + " \n " + body
                                 
-                                # 遍历配置好的平台关键字，寻找验证码
                                 for platform in TARGET_PLATFORMS:
                                     keywords = PLATFORM_KEYWORDS.get(platform, [platform])
                                     if any(kw in sender or kw in full_text.lower() for kw in keywords):
                                         code = parse_verification_code_with_context(full_text, keywords)
                                         if code:
                                             print(f"【💥 捕获】{email_account} | {platform} | {code}")
-                                            # 将最新拿到的验证码放进缓存，供客户端拉取
                                             code_storage[platform] = {"code": code, "email": email_account}
                                             
-                        # 恢复挂起监听状态
+                                            # ⭐ 用户需求：获取到验证码后的邮箱标记为已读！
+                                            try:
+                                                server.add_flags([uid], '\\Seen')
+                                            except Exception as e:
+                                                print(f"标记已读失败，但不影响使用: {e}")
+                                            
                         server.idle()
         except Exception as e: 
             print(f"[网络异常] IMAP 监听断开，10秒后重连... {e}")
