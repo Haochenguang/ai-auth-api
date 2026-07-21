@@ -93,7 +93,7 @@ def init_db():
 
 init_db()
 
-def parse_verification_code_with_context(text, keywords):
+def parse_verification_code_with_context(text, keywords, platform_name=""):
     # 🚨 新增：暴力清除所有短信网关经常注入的不可见“零宽字符”
     clean_text = re.sub(r'[\u200b\u200c\u200d\uFEFF]', '', text)
     
@@ -105,7 +105,7 @@ def parse_verification_code_with_context(text, keywords):
     clean_text_lower = clean_text.lower()
     
     # 1. 🌟 针对 Pixmax 平台的专属强力提取逻辑（兼容小方块、带空格或HTML标签隔开的 6 位数字）
-    if platform_name.lower() == 'pixmax':
+    if platform_name.lower() == 'Pixmax':
         # 尝试直接从清洗后的文本中找 6 位连续数字
         match_six = re.search(r'(\d{6})', clean_text)
         if match_six:
