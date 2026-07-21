@@ -92,7 +92,10 @@ def init_db():
 init_db()
 
 def parse_verification_code_with_context(text, keywords):
-    clean_text = re.sub(r'<style.*?>.*?</style>', ' ', text, flags=re.IGNORECASE|re.DOTALL)
+    # 🚨 新增：暴力清除所有短信网关经常注入的不可见“零宽字符”
+    clean_text = re.sub(r'[\u200b\u200c\u200d\uFEFF]', '', text)
+    
+    clean_text = re.sub(r'<style.*?>.*?</style>', ' ', clean_text, flags=re.IGNORECASE|re.DOTALL)
     clean_text = re.sub(r'<script.*?>.*?</script>', ' ', clean_text, flags=re.IGNORECASE|re.DOTALL)
     clean_text = re.sub(r'<[^>]+>', ' ', clean_text)
     clean_text = html.unescape(clean_text)
@@ -100,7 +103,8 @@ def parse_verification_code_with_context(text, keywords):
     clean_text_lower = clean_text.lower()
     
     for kw in keywords:
-        match = re.search(rf"{kw}.{{0,150}}?(?<!\d)(\d{{4,6}})(?!\d)", clean_text_lower)
+        # 放宽距离限制，从 150 提升到 250，防止短信前缀过长
+        match = re.search(rf"{kw}.{{0,250}}?(?<!\d)(\d{{4,6}})(?!\d)", clean_text_lower)
         if match: return match.group(1)
         
     filtered_text = re.sub(r'(?<!\d)106\d+(?!\d)', ' ', clean_text)               
@@ -120,75 +124,70 @@ def monitor_single_account(email_account, app_password):
             with IMAPClient(FEISHU_IMAP_SERVER, ssl=True) as server:
                 server.login(email_account, app_password)
                 server.select_folder('INBOX')
-                print(f"[✔] 邮箱 {email_account} 开始监听...")
+                print(f"[✔] 邮箱 {email_account} 开始主动轮询监听 (抗掉线模式)...")
                 
-                # 🚀 【核心机制】：启动时，将现有的历史邮件强行拉入黑名单！
-                # 这样重启脚本时，绝对不会把邮箱里的旧邮件当成新邮件去提取。
                 existing_messages = server.search('ALL')
                 if existing_messages:
-                    processed_uids.update(existing_messages[-20:]) # 屏蔽最近的20封历史邮件
+                    processed_uids.update(existing_messages[-20:]) 
                 
-                server.idle()
-                
+                # 🚀 彻底抛弃不稳定的 server.idle()，改为死循环主动搜索
                 while True:
-                    responses = server.idle_check(timeout=1740) 
-                    if responses:
-                        server.idle_done() 
+                    time.sleep(3)  # 每 3 秒拉取一次，防止被飞书判定为攻击
+                    
+                    messages = server.search('ALL')
+                    if not messages:
+                        continue
                         
-                        messages = server.search('ALL')
-                        recent_messages = messages[-5:] if len(messages) >= 5 else messages
+                    recent_messages = messages[-5:] if len(messages) >= 5 else messages
+                    
+                    for uid in recent_messages:
+                        if uid in processed_uids:
+                            continue 
                         
-                        for uid in recent_messages:
-                            # 🚨 防线一：UID 指纹锁（彻底删除了那个惹祸的时间锁）
-                            if uid in processed_uids:
-                                continue 
+                        processed_uids.add(uid)
+                        
+                        message_data = server.fetch([uid], 'RFC822')
+                        for _, data in message_data.items():
+                            msg = email.message_from_bytes(data[b'RFC822'])
                             
-                            processed_uids.add(uid)
-                            
-                            message_data = server.fetch([uid], 'RFC822')
-                            for _, data in message_data.items():
-                                msg = email.message_from_bytes(data[b'RFC822'])
-                                
-                                sender = msg.get("From", "").lower()
-                                subject = msg.get("Subject", "")
-                                try:
-                                    decoded_subject = ""
-                                    for part, encoding in decode_header(subject):
-                                        if isinstance(part, bytes): decoded_subject += part.decode(encoding or 'utf-8', errors='ignore')
-                                        else: decoded_subject += part
-                                    subject_str = decoded_subject.lower()
-                                except: subject_str = str(subject).lower()
+                            sender = msg.get("From", "").lower()
+                            subject = msg.get("Subject", "")
+                            try:
+                                decoded_subject = ""
+                                for part, encoding in decode_header(subject):
+                                    if isinstance(part, bytes): decoded_subject += part.decode(encoding or 'utf-8', errors='ignore')
+                                    else: decoded_subject += part
+                                subject_str = decoded_subject.lower()
+                            except: subject_str = str(subject).lower()
 
-                                body = ""
-                                if msg.is_multipart():
-                                    for part in msg.walk():
-                                        if part.get_content_type() in ["text/plain", "text/html"]:
-                                            payload = part.get_payload(decode=True)
-                                            if payload: body += payload.decode(errors='ignore')
-                                else:
-                                    payload = msg.get_payload(decode=True)
-                                    if payload: body = payload.decode(errors='ignore')
-                                
-                                full_text = subject_str + " \n " + body
-                                
-                                for platform in TARGET_PLATFORMS:
-                                    keywords = PLATFORM_KEYWORDS.get(platform, [platform])
-                                    if any(kw in sender or kw in full_text.lower() for kw in keywords):
-                                        code = parse_verification_code_with_context(full_text, keywords)
-                                        if code:
-                                            print(f"【💥 捕获】{email_account} | {platform} | {code}")
-                                            code_storage[platform] = {"code": code, "email": email_account}
-                                            
-                                            # ⭐ 用户需求：获取到验证码后的邮箱标记为已读！
-                                            try:
-                                                server.add_flags([uid], '\\Seen')
-                                            except Exception as e:
-                                                print(f"标记已读失败，但不影响使用: {e}")
-                                            
-                        server.idle()
+                            body = ""
+                            if msg.is_multipart():
+                                for part in msg.walk():
+                                    if part.get_content_type() in ["text/plain", "text/html"]:
+                                        payload = part.get_payload(decode=True)
+                                        if payload: body += payload.decode(errors='ignore')
+                            else:
+                                payload = msg.get_payload(decode=True)
+                                if payload: body = payload.decode(errors='ignore')
+                            
+                            full_text = subject_str + " \n " + body
+                            
+                            for platform in TARGET_PLATFORMS:
+                                keywords = PLATFORM_KEYWORDS.get(platform, [platform])
+                                if any(kw in sender or kw in full_text.lower() for kw in keywords):
+                                    code = parse_verification_code_with_context(full_text, keywords)
+                                    if code:
+                                        print(f"【💥 捕获】{email_account} | {platform} | {code}")
+                                        code_storage[platform] = {"code": code, "email": email_account}
+                                        
+                                        try:
+                                            server.add_flags([uid], '\\Seen')
+                                        except Exception as e:
+                                            print(f"标记已读失败: {e}")
+                                        
         except Exception as e: 
-            print(f"[网络异常] IMAP 监听断开，10秒后重连... {e}")
-            time.sleep(10)
+            print(f"[网络异常] IMAP 轮询断开，5秒后重连... {e}")
+            time.sleep(5)
 
 # ================= 🔌 普通客户端 API =================
 @app.route('/api/register', methods=['POST'])
