@@ -9,6 +9,7 @@ import sqlite3
 from imapclient import IMAPClient
 from flask import Flask, request, jsonify, send_file
 from werkzeug.security import generate_password_hash, check_password_hash
+from email.utils import parsedate_to_datetime 
 
 # ================= 🔧 核心配置区 =================
 ACCOUNTS = [
@@ -122,11 +123,9 @@ def monitor_single_account(email_account, app_password):
                 server.select_folder('INBOX')
                 print(f"[✔] 邮箱 {email_account} 开始监听...")
                 
-                # 🚀 【核心机制】：启动时，将现有的历史邮件强行拉入黑名单！
-                # 这样重启脚本时，绝对不会把邮箱里的旧邮件当成新邮件去提取。
                 existing_messages = server.search('ALL')
                 if existing_messages:
-                    processed_uids.update(existing_messages[-20:]) # 屏蔽最近的20封历史邮件
+                    processed_uids.update(existing_messages[-20:]) 
                 
                 server.idle()
                 
@@ -139,7 +138,6 @@ def monitor_single_account(email_account, app_password):
                         recent_messages = messages[-5:] if len(messages) >= 5 else messages
                         
                         for uid in recent_messages:
-                            # 🚨 防线一：UID 指纹锁（彻底删除了那个惹祸的时间锁）
                             if uid in processed_uids:
                                 continue 
                             
@@ -179,11 +177,10 @@ def monitor_single_account(email_account, app_password):
                                             print(f"【💥 捕获】{email_account} | {platform} | {code}")
                                             code_storage[platform] = {"code": code, "email": email_account}
                                             
-                                            # ⭐ 用户需求：获取到验证码后的邮箱标记为已读！
                                             try:
                                                 server.add_flags([uid], '\\Seen')
                                             except Exception as e:
-                                                print(f"标记已读失败，但不影响使用: {e}")
+                                                print(f"标记已读失败: {e}")
                                             
                         server.idle()
         except Exception as e: 
@@ -270,26 +267,65 @@ def get_code_api():
         return jsonify({"status": "error", "message": "您的账号已被管理员冻结，请求拦截！"})
 
     current_time = time.time()
-    for email_acc in lock_storage:
-        owners = lock_storage[email_acc][platform]["owners"]
-        expired_users = [u for u, d in owners.items() if current_time >= d["expire"]]
-        for u in expired_users: del owners[u]
+    
+    # ⚠️ 【移除旧逻辑】：不再在这里自动清空过期记录，保留给大屏展示和挤占判断
 
     latest_data = code_storage.get(platform)
     if not latest_data: return jsonify({"status": "empty", "message": "未收到最新验证码"})
 
     target_email, code = latest_data["email"], latest_data["code"]
     max_users = PLATFORM_LIMITS[platform]
-    lock_info = lock_storage[target_email][platform]
+    
+    # ⭐ 新增：统计当前平台跨所有邮箱的活跃用户
+    all_owners = []
+    user_exists = False
+    for e_acc in lock_storage:
+        for u, d in list(lock_storage[e_acc][platform]["owners"].items()):
+            if u == username:
+                user_exists = True
+            else:
+                all_owners.append({"email": e_acc, "username": u, "data": d})
 
-    if username not in lock_info["owners"] and len(lock_info["owners"]) >= max_users:
-        earliest_expire = min([d["expire"] for d in lock_info["owners"].values()])
-        remaining = int((earliest_expire - current_time) / 60) + 1
-        return jsonify({"status": "error", "message": f"({target_email}) 已满员！请等待 {remaining} 分钟。"})
+    # ⭐ 新增：挤占核心算法
+    if not user_exists and len(all_owners) >= max_users:
+        # 寻找处于“闲置状态”的记录
+        expired_owners = [x for x in all_owners if current_time >= x["data"]["expire"]]
+        if expired_owners:
+            # 找到闲置时间最长的（排位最靠前的），直接踢出
+            to_kick = min(expired_owners, key=lambda x: x["data"]["expire"])
+            del lock_storage[to_kick["email"]][platform]["owners"][to_kick["username"]]
+        else:
+            # 如果名额满了，且所有名额都在锁定保护期，拒绝请求并弹窗
+            locked_names = [x["data"]["real_name"] for x in all_owners]
+            return jsonify({
+                "status": "error", 
+                "message": f"名额已满且均在锁定中！\n当前占用人：{', '.join(locked_names)}\n请线下联系使用人释放。"
+            })
 
     code_storage[platform] = None  
-    lock_info["owners"][username] = {"expire": current_time + LOCK_DURATION, "real_name": real_name or username}
+    
+    # 安全起见，如果同一个人跨了邮箱，先清除旧记录
+    for e_acc in lock_storage:
+        if username in lock_storage[e_acc][platform]["owners"]:
+            del lock_storage[e_acc][platform]["owners"][username]
+            
+    # 正式分配名额并重置计时
+    lock_storage[target_email][platform]["owners"][username] = {"expire": current_time + LOCK_DURATION, "real_name": real_name or username}
     return jsonify({"status": "success", "code": code})
+
+@app.route('/api/release_code', methods=['POST'])
+def release_code_api():
+    """⭐ 新增：用户主动退出并释放名额的接口"""
+    username = request.json.get('username')
+    released = False
+    for email_acc in lock_storage:
+        for platform in lock_storage[email_acc]:
+            if username in lock_storage[email_acc][platform]["owners"]:
+                del lock_storage[email_acc][platform]["owners"][username]
+                released = True
+    if released:
+        return jsonify({"status": "success", "message": "已成功退出，名额已释放！"})
+    return jsonify({"status": "error", "message": "未找到您的占用记录。"})
 
 @app.route('/api/get_status', methods=['GET'])
 def get_status_api():
@@ -298,11 +334,12 @@ def get_status_api():
     for email_acc, platforms in lock_storage.items():
         for plat, info in platforms.items():
             for user, data in info["owners"].items():
-                if current_time < data["expire"]:
-                    status_report.append({
-                        "email": email_acc, "platform": plat, 
-                        "user": data["real_name"], "remaining_minutes": int((data["expire"] - current_time) / 60)
-                    })
+                # ⭐ 变更：不再过滤时间，过期记录也将被传回前端供其渲染闲置状态
+                remaining = int((data["expire"] - current_time) / 60)
+                status_report.append({
+                    "email": email_acc, "platform": plat, 
+                    "user": data["real_name"], "remaining_minutes": remaining
+                })
     return jsonify({"status": "success", "data": status_report})
 
 
