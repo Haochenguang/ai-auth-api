@@ -32,7 +32,7 @@ PLATFORM_KEYWORDS = {
     'chatgpt': ['chatgpt', 'openai'], 
     'jimeng': ['jimeng', '即梦'],
     'keling': ['keling', '可灵'],
-    'Pixmax': ['Pixmax']
+    'Pixmax': ['Pixmax', 'mail.pixmax.cn']
 }
 
 ADMIN_SECRET = "SuperAdmin2026" 
@@ -103,6 +103,20 @@ def parse_verification_code_with_context(text, keywords):
     clean_text = html.unescape(clean_text)
     clean_text = re.sub(r'\s+', ' ', clean_text)
     clean_text_lower = clean_text.lower()
+    
+    # 1. 🌟 针对 Pixmax 平台的专属强力提取逻辑（兼容小方块、带空格或HTML标签隔开的 6 位数字）
+    if platform_name.lower() == 'pixmax':
+        # 尝试直接从清洗后的文本中找 6 位连续数字
+        match_six = re.search(r'(\d{6})', clean_text)
+        if match_six:
+            return match_six.group(1)
+        
+        # 如果被 HTML 标签或空格彻底打散，提取所有数字并尝试寻找 6 位组合
+        all_digits = "".join(re.findall(r'\d', clean_text_raw))
+        if len(all_digits) >= 6:
+            match_loose = re.search(r'(\d{6})', all_digits)
+            if match_loose:
+                return match_loose.group(1)
     
     for kw in keywords:
         # 放宽距离限制，从 150 提升到 250，防止短信前缀过长
@@ -177,7 +191,7 @@ def monitor_single_account(email_account, app_password):
                             for platform in TARGET_PLATFORMS:
                                 keywords = PLATFORM_KEYWORDS.get(platform, [platform])
                                 if any(kw in sender or kw in full_text.lower() for kw in keywords):
-                                    code = parse_verification_code_with_context(full_text, keywords)
+                                    code = parse_verification_code_with_context(full_text, keywords, platform_name=platform)
                                     if code:
                                         print(f"【💥 捕获】{email_account} | {platform} | {code}")
                                         code_storage[platform] = {"code": code, "email": email_account}
