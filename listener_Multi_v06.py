@@ -23,14 +23,16 @@ PLATFORM_LIMITS = {
     'lovart': 2,        
     'chatgpt': 5,       
     'jimeng': 10,       
-    'keling': 10        
+    'keling': 10,  
+    'Pixmax': 10
 }
 
 PLATFORM_KEYWORDS = {
     'lovart': ['lovart'],
     'chatgpt': ['chatgpt', 'openai'], 
     'jimeng': ['jimeng', '即梦'],
-    'keling': ['keling', '可灵']
+    'keling': ['keling', '可灵'],
+    'Pixmax': ['Pixmax']
 }
 
 ADMIN_SECRET = "SuperAdmin2026" 
