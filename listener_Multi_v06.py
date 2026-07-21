@@ -94,36 +94,39 @@ def init_db():
 init_db()
 
 def parse_verification_code_with_context(text, keywords, platform_name=""):
-    # 🚨 暴力清除所有短信网关经常注入的不可见“零宽字符”
+    # 🚨 新增：暴力清除所有短信网关经常注入的不可见“零宽字符”
     clean_text = re.sub(r'[\u200b\u200c\u200d\uFEFF]', '', text)
     
     clean_text = re.sub(r'<style.*?>.*?</style>', ' ', clean_text, flags=re.IGNORECASE|re.DOTALL)
     clean_text = re.sub(r'<script.*?>.*?</script>', ' ', clean_text, flags=re.IGNORECASE|re.DOTALL)
-    clean_text_raw = clean_text # 安全保留带标签的原始文本
-    
     clean_text = re.sub(r'<[^>]+>', ' ', clean_text)
     clean_text = html.unescape(clean_text)
     clean_text = re.sub(r'\s+', ' ', clean_text)
     clean_text_lower = clean_text.lower()
     
-    # 1. 🌟 【通用智能重组提取】针对 Pixmax 或其他排版打散的平台：
-    # 直接提取整封邮件里的所有数字，如果凑巧或连续出现 6 位数字，直接抓取！
-    all_digits = "".join(re.findall(r'\d', clean_text_raw))
-    if len(all_digits) >= 6:
-        match_loose = re.search(r'(\d{6})', all_digits)
-        if match_loose:
-            return match_loose.group(1)
-
-    # 2. 标准上下文关键词匹配逻辑（兼容所有平台）
+    # 1. 🌟 针对 Pixmax 平台的专属强力提取逻辑（兼容小方块、带空格或HTML标签隔开的 6 位数字）
+    if platform_name.lower() == 'Pixmax':
+        # 尝试直接从清洗后的文本中找 6 位连续数字
+        match_six = re.search(r'(\d{6})', clean_text)
+        if match_six:
+            return match_six.group(1)
+        
+        # 如果被 HTML 标签或空格彻底打散，提取所有数字并尝试寻找 6 位组合
+        all_digits = "".join(re.findall(r'\d', clean_text_raw))
+        if len(all_digits) >= 6:
+            match_loose = re.search(r'(\d{6})', all_digits)
+            if match_loose:
+                return match_loose.group(1)
+    
     for kw in keywords:
+        # 放宽距离限制，从 150 提升到 250，防止短信前缀过长
         match = re.search(rf"{kw}.{{0,250}}?(?<!\d)(\d{{4,6}})(?!\d)", clean_text_lower)
         if match: return match.group(1)
         
-    # 3. 兜底通用数字过滤
-    filtered_text = re.sub(r'(?<!\d)106\d+(?!\d)', ' ', clean_text)                
-    filtered_text = re.sub(r'(?i)uid\s*[:：]?\s*\d+', ' ', filtered_text)        
-    filtered_text = re.sub(r'\d{4}-\d{2}-\d{2}', ' ', filtered_text)            
-    filtered_text = re.sub(r'\d{2}:\d{2}(:\d{2})?', ' ', filtered_text)          
+    filtered_text = re.sub(r'(?<!\d)106\d+(?!\d)', ' ', clean_text)               
+    filtered_text = re.sub(r'(?i)uid\s*[:：]?\s*\d+', ' ', filtered_text)       
+    filtered_text = re.sub(r'\d{4}-\d{2}-\d{2}', ' ', filtered_text)           
+    filtered_text = re.sub(r'\d{2}:\d{2}(:\d{2})?', ' ', filtered_text)         
     filtered_text = re.sub(r'(?i)(copyright|©)\s*\d{4}', ' ', filtered_text)
     match = re.search(r'(?<!\d)\d{4,6}(?!\d)', filtered_text)
     return match.group(0) if match else None
