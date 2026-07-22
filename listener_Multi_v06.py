@@ -2,12 +2,13 @@ import os
 import time
 import re
 import email
+import requests
 from email.header import decode_header
 import threading
 import html
 import sqlite3
 from imapclient import IMAPClient
-from flask import Flask, request, jsonify, send_file
+from flask import Flask, request, jsonify, send_file, redirect
 from werkzeug.security import generate_password_hash, check_password_hash
 
 # ================= 🔧 核心配置区 =================
@@ -41,6 +42,16 @@ DISPLAY_ACCOUNT_MAP = {
     'keling': '13810954214'
     # 其他平台如果没有定义，会默认显示原本的邮箱
 }
+
+# ================= 飞书开放平台配置 =================
+# 🛡️ 安全优化：通过环境变量获取密钥，若未设置则读取默认测试值或报错
+FEISHU_APP_ID = os.environ.get("FEISHU_APP_ID", "cli_aaea3c76e123dbd1")
+FEISHU_APP_SECRET = os.environ.get("FEISHU_APP_SECRET", "你的正式环境Secret")
+FEISHU_REDIRECT_URI = os.environ.get("FEISHU_REDIRECT_URI", "https://你的真实公网域名/api/feishu/callback")
+
+# 临时存放客户端扫码状态的内存池
+feishu_login_tickets = {} 
+# =================================================
 
 ADMIN_SECRET = "SuperAdmin2026" 
 DEFAULT_INVITE_CODE = "SBF2026"  
@@ -210,71 +221,155 @@ def monitor_single_account(email_account, app_password):
             print(f"[网络异常] IMAP 轮询断开，5秒后重连... {e}")
             time.sleep(5)
 
-# ================= 🔌 普通客户端 API =================
-@app.route('/api/register', methods=['POST'])
-def register_api():
-    data = request.json
-    username, password, real_name, invite_code = data.get('username'), data.get('password'), data.get('real_name'), data.get('invite_code')
-    client_ip = get_client_ip()
+# --- 飞书登录 API 1：唤起授权 ---
+@app.route('/api/feishu/login')
+def feishu_login():
+    ticket = request.args.get('ticket')
+    if ticket:
+        feishu_login_tickets[ticket] = {"status": "pending"}
+    # 将 ticket 作为 state 参数传递给飞书，飞书会在回调时原封不动带回来
+    auth_url = f"https://open.feishu.cn/open-apis/authen/v1/index?redirect_uri={FEISHU_REDIRECT_URI}&app_id={FEISHU_APP_ID}&state={ticket}"
+    return redirect(auth_url)
 
-    conn = sqlite3.connect(DB_FILE)
-    c = conn.cursor()
-    c.execute("SELECT value FROM settings WHERE key='invite_code'")
-    current_invite = c.fetchone()[0]
-
-    if invite_code != current_invite: return jsonify({"status": "error", "message": "企业邀请码错误或已失效！"})
-    if not username or not password or not real_name: return jsonify({"status": "error", "message": "信息填写不完整！"})
-
-    hashed_password = generate_password_hash(password)
-    try:
-        c.execute("INSERT INTO users (username, password_hash, real_name, last_ip, max_devices) VALUES (?, ?, ?, ?, 1)", (username, hashed_password, real_name, client_ip))
-        conn.commit()
-        conn.close()
-        return jsonify({"status": "success", "message": "注册成功！"})
-    except sqlite3.IntegrityError:
-        return jsonify({"status": "error", "message": "用户名已存在！"})
-
-@app.route('/api/login', methods=['POST'])
-def login_api():
-    data = request.json
-    username, password = data.get('username'), data.get('password')
-    machine_code = data.get('machine_code')
-    client_ip = get_client_ip()
-
-    conn = sqlite3.connect(DB_FILE)
-    c = conn.cursor()
-    c.execute("SELECT password_hash, real_name, is_locked, max_devices FROM users WHERE username=?", (username,))
-    row = c.fetchone()
+# --- 飞书登录 API 2：扫码后的回调处理 ---
+@app.route('/api/feishu/callback')
+def feishu_callback():
+    code = request.args.get('code')
+    ticket = request.args.get('state') 
     
-    if row and check_password_hash(row[0], password):
-        if row[2] == 1: 
-            return jsonify({"status": "error", "message": "账号已被管理员锁定，禁止登录！"})
-        
-        c.execute("SELECT value FROM settings WHERE key='check_machine_code'")
-        check_machine_status = c.fetchone()
-        check_machine_code = True if not check_machine_status else (check_machine_status[0] == '1')
-        
-        if check_machine_code:
-            if not machine_code: return jsonify({"status": "error", "message": "环境异常：无法获取设备物理网卡地址！"})
-            max_dev = row[3]
-            c.execute("SELECT machine_code FROM user_devices WHERE username=?", (username,))
-            bound_devices = [r[0] for r in c.fetchall()]
-            
-            if machine_code not in bound_devices:
-                if len(bound_devices) >= max_dev:
-                    conn.close()
-                    return jsonify({"status": "error", "message": f"登录被拒绝：该账号绑定的电脑数量已达上限 ({max_dev}台)。\n请在原办公电脑使用，或联系管理员解绑！"})
-                else:
-                    c.execute("INSERT INTO user_devices (username, machine_code) VALUES (?, ?)", (username, machine_code))
-        
-        c.execute("UPDATE users SET last_ip=? WHERE username=?", (client_ip, username))
-        conn.commit()
-        conn.close()
-        return jsonify({"status": "success", "username": username, "real_name": row[1]})
-        
-    conn.close()
-    return jsonify({"status": "error", "message": "账号或密码错误！"})
+    if not code or not ticket: return "参数错误", 400
 
+    try:
+        # 1. 获取 app_access_token
+        app_token_res = requests.post("https://open.feishu.cn/open-apis/auth/v3/app_access_token/internal", 
+            json={"app_id": FEISHU_APP_ID, "app_secret": FEISHU_APP_SECRET}).json()
+        app_token = app_token_res.get("tenant_access_token")
+
+        # 2. 获取 user_access_token (代表该用户的身份凭证)
+        user_token_res = requests.post("https://open.feishu.cn/open-apis/authen/v1/oidc/access_token",
+            headers={"Authorization": f"Bearer {app_token}"},
+            json={"grant_type": "authorization_code", "code": code}).json()
+        user_token = user_token_res.get("data", {}).get("access_token")
+
+        # 3. 获取用户基本信息 (需要 contact:user.base:readonly 权限)
+        user_info_res = requests.get("https://open.feishu.cn/open-apis/authen/v1/user_info",
+            headers={"Authorization": f"Bearer {user_token}"}).json()
+        user_info = user_info_res.get("data", {})
+        
+        open_id = user_info.get("open_id")
+        
+        # 提取中文名和英文名，并将它们合并以匹配飞书客户端的显示
+        base_name = user_info.get("name", "")
+        en_name = user_info.get("en_name", "")
+        
+        # 加一个防重复判断：如果英文名存在，且和中文名不一样，才拼在一起
+        if en_name and en_name != base_name:
+            display_name = f"{base_name}{en_name}"
+        else:
+            display_name = base_name
+
+        if open_id and display_name:
+            conn = sqlite3.connect(DB_FILE)
+            c = conn.cursor()
+            c.execute("SELECT id FROM users WHERE username=?", (open_id,))
+            if not c.fetchone():
+                # 首次扫码，自动注册账号
+                c.execute("INSERT INTO users (username, password_hash, real_name, last_ip, max_devices) VALUES (?, ?, ?, ?, 1)",
+                          (open_id, "FEISHU_OAUTH_DUMMY", display_name, "feishu_web"))
+            else:
+                # 非首次扫码，强制更新为飞书最新的名字，保持实时同步
+                c.execute("UPDATE users SET real_name=? WHERE username=?", (display_name, open_id))
+            conn.commit()
+            conn.close()
+
+            # 将同步后的最新名字传给客户端
+            feishu_login_tickets[ticket] = {"status": "success", "username": open_id, "real_name": display_name}
+            
+            # ================== 自动关闭网页的 HTML ==================
+            return f"""
+            <div style="text-align:center; margin-top:150px; font-family:sans-serif;">
+                <h1 style="color:#00E676; font-size: 40px;">✔ 授权成功</h1>
+                <h2 style="color:#333;">你好，{display_name}</h2>
+                <p style="color:#666;" id="close-text">身份已验证，页面将在 3 秒后自动关闭...</p>
+            </div>
+            <script>
+                // 3秒后尝试自动关闭窗口
+                setTimeout(function() {{
+                    window.close();
+                    // 兜底提示：部分浏览器可能会安全拦截自动关闭，给出手动关闭提示
+                    document.getElementById('close-text').innerText = "身份已验证，您可以手动关闭本网页返回客户端";
+                }}, 3000);
+                
+                // 倒计时数字显示逻辑
+                let count = 3;
+                setInterval(function() {{
+                    count--;
+                    if(count > 0) {{
+                        document.getElementById('close-text').innerText = "身份已验证，页面将在 " + count + " 秒后自动关闭...";
+                    }}
+                }}, 1000);
+            </script>
+            """
+        else:
+            return "获取飞书用户信息失败", 500
+    except Exception as e:
+        return f"授权发生异常: {str(e)}", 500
+
+# --- 飞书登录 API 3：客户端轮询接口 (带设备码安全校验) ---
+@app.route('/api/feishu/check')
+def feishu_check():
+    ticket = request.args.get('ticket')
+    machine_code = request.args.get('machine_code')
+    client_ip = get_client_ip()
+
+    ticket_data = feishu_login_tickets.get(ticket)
+    if not ticket_data: return jsonify({"status": "pending"})
+    
+    if ticket_data["status"] == "success":
+        username = ticket_data["username"]
+        real_name = ticket_data["real_name"]
+
+        # 执行设备校验 (复用原有的硬件绑定逻辑)
+        conn = sqlite3.connect(DB_FILE)
+        c = conn.cursor()
+        c.execute("SELECT is_locked, max_devices FROM users WHERE username=?", (username,))
+        row = c.fetchone()
+        
+        if row:
+            if row[0] == 1: 
+                conn.close()
+                return jsonify({"status": "error", "message": "账号已被管理员锁定，禁止登录！"})
+            
+            c.execute("SELECT value FROM settings WHERE key='check_machine_code'")
+            check_machine_status = c.fetchone()
+            check_machine_code = True if not check_machine_status else (check_machine_status[0] == '1')
+            
+            if check_machine_code:
+                if not machine_code: 
+                    conn.close()
+                    return jsonify({"status": "error", "message": "无法获取设备网卡地址！"})
+                max_dev = row[1]
+                c.execute("SELECT machine_code FROM user_devices WHERE username=?", (username,))
+                bound_devices = [r[0] for r in c.fetchall()]
+                
+                if machine_code not in bound_devices:
+                    if len(bound_devices) >= max_dev:
+                        conn.close()
+                        return jsonify({"status": "error", "message": f"设备已达上限 ({max_dev}台)。"})
+                    else:
+                        c.execute("INSERT INTO user_devices (username, machine_code) VALUES (?, ?)", (username, machine_code))
+            
+            c.execute("UPDATE users SET last_ip=? WHERE username=?", (client_ip, username))
+            conn.commit()
+        conn.close()
+
+        # 消费掉这个 ticket，防止重复请求
+        del feishu_login_tickets[ticket]
+        return jsonify({"status": "success", "username": username, "real_name": real_name})
+    
+    return jsonify({"status": "pending"})
+
+# ================= 🔌 普通功能 API =================
 @app.route('/api/get_code', methods=['GET'])
 def get_code_api():
     platform, username, real_name = request.args.get('platform'), request.args.get('username'), request.args.get('real_name')
@@ -290,11 +385,7 @@ def get_code_api():
         return jsonify({"status": "error", "message": "您的账号已被管理员冻结，请求拦截！"})
 
     current_time = time.time()
-    #for email_acc in lock_storage:
-    #    owners = lock_storage[email_acc][platform]["owners"]
-    #    expired_users = [u for u, d in owners.items() if current_time >= d["expire"]]
-    #    for u in expired_users: del owners[u]
-
+    
     latest_data = code_storage.get(platform)
     if not latest_data: return jsonify({"status": "empty", "message": "未收到最新验证码"})
 
@@ -303,7 +394,7 @@ def get_code_api():
     lock_info = lock_storage[target_email][platform]
 
     if username not in lock_info["owners"] and len(lock_info["owners"]) >= max_users:
-        # ✅ 新增：检查是否有可挤占（已过期）的名额
+        # ✅ 检查是否有可挤占（已过期）的名额
         expired_users = [(u, d) for u, d in lock_info["owners"].items() if current_time >= d["expire"]]
         if expired_users:
             # 找到最早过期的用户，将其踢出
@@ -340,6 +431,16 @@ def get_status_api():
                     "is_bumpable": is_expired # 新增状态标记
                 })
     return jsonify({"status": "success", "data": status_report})
+
+@app.route('/api/release_lock', methods=['POST'])
+def release_lock_api():
+    # 用户自己主动退出的接口
+    username = request.json.get('username')
+    for email_acc, platforms in lock_storage.items():
+        for plat, info in platforms.items():
+            if username in info["owners"]:
+                del info["owners"][username]
+    return jsonify({"status": "success", "message": "已主动释放名额"})
 
 
 # ================= 🛡️ 超级管理员专属 API 接口区 =================
@@ -410,6 +511,7 @@ def admin_delete_user():
 
 @app.route('/api/admin/user/add', methods=['POST'])
 def admin_add_user():
+    # 保留管理员端后台强制制创建测试账号的功能
     if not check_admin(request.json): return jsonify({"status": "error", "message": "权限拒绝"}), 403
     username, password, real_name = request.json.get('username'), request.json.get('password'), request.json.get('real_name')
     hashed_password = generate_password_hash(password)
@@ -455,15 +557,6 @@ def admin_get_set_settings():
     
     conn.close()
     return jsonify({"status": "success", "message": " | ".join(msg) if msg else "获取成功", "invite_code": current_invite, "check_machine_code": current_machine})
-@app.route('/api/release_lock', methods=['POST'])
-def release_lock_api():
-    # 用户自己主动退出的接口
-    username = request.json.get('username')
-    for email_acc, platforms in lock_storage.items():
-        for plat, info in platforms.items():
-            if username in info["owners"]:
-                del info["owners"][username]
-    return jsonify({"status": "success", "message": "已主动释放名额"})
 
 @app.route('/api/admin/kick_session', methods=['POST'])
 def admin_kick_session():
