@@ -44,9 +44,10 @@ DISPLAY_ACCOUNT_MAP = {
 }
 
 # ================= 飞书开放平台配置 =================
-FEISHU_APP_ID = "cli_aaea3c76e123dbd1"         # 替换为你在飞书后台申请的 App ID
-FEISHU_APP_SECRET = "O7i2nGgLsj9BkFWuXgNcBgaTkMYHY1Ch"     # 替换为你在飞书后台申请的 App Secret
-FEISHU_REDIRECT_URI = "https://o6y0id3cbnfsnl0qemlma0cu.lab.kore.my/api/feishu_callback"
+# 🛡️ 安全优化：通过环境变量获取密钥，若未设置则读取默认测试值或报错
+FEISHU_APP_ID = os.environ.get("FEISHU_APP_ID", "cli_aaea3c76e123dbd1")
+FEISHU_APP_SECRET = os.environ.get("FEISHU_APP_SECRET", "你的正式环境Secret")
+FEISHU_REDIRECT_URI = os.environ.get("FEISHU_REDIRECT_URI", "https://你的真实公网域名/api/feishu/callback")
 
 # 临时存放客户端扫码状态的内存池
 feishu_login_tickets = {} 
