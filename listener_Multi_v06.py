@@ -32,7 +32,7 @@ PLATFORM_KEYWORDS = {
     'lovart': ['lovart'],
     'chatgpt': ['chatgpt', 'openai'], 
     'jimeng': ['jimeng', '即梦'],
-    'keling': ['keling', '可灵'],
+    'keling': ['keling', '可灵', '快手科技'],
     'Pixmax': ['Pixmax', 'mail.pixmax.cn']
 }
 
