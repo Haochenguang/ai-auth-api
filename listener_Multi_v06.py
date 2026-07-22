@@ -35,6 +35,13 @@ PLATFORM_KEYWORDS = {
     'Pixmax': ['Pixmax', 'mail.pixmax.cn']
 }
 
+# 源账号：定义一个显示映射字典（可以将邮箱转换为你想要的任何文本）
+DISPLAY_ACCOUNT_MAP = {
+    'jimeng': '18611560059',
+    'keling': '13810954214'
+    # 其他平台如果没有定义，会默认显示原本的邮箱
+}
+
 ADMIN_SECRET = "SuperAdmin2026" 
 DEFAULT_INVITE_CODE = "SBF2026"  
 
@@ -94,42 +101,40 @@ def init_db():
 init_db()
 
 def parse_verification_code_with_context(text, keywords, platform_name=""):
-    # 🚨 新增：暴力清除所有短信网关经常注入的不可见“零宽字符”
+    # 🚨 清除所有不可见“零宽字符”
     clean_text = re.sub(r'[\u200b\u200c\u200d\uFEFF]', '', text)
     
+    # 清理样式和脚本
     clean_text = re.sub(r'<style.*?>.*?</style>', ' ', clean_text, flags=re.IGNORECASE|re.DOTALL)
     clean_text = re.sub(r'<script.*?>.*?</script>', ' ', clean_text, flags=re.IGNORECASE|re.DOTALL)
-    clean_text = re.sub(r'<[^>]+>', ' ', clean_text)
-    clean_text = html.unescape(clean_text)
-    clean_text = re.sub(r'\s+', ' ', clean_text)
-    clean_text_lower = clean_text.lower()
     
-    # 1. 🌟 针对 Pixmax 平台的专属强力提取逻辑（兼容小方块、带空格或HTML标签隔开的 6 位数字）
-    if platform_name.lower() == 'Pixmax':
-        # 尝试直接从清洗后的文本中找 6 位连续数字
-        match_six = re.search(r'(\d{6})', clean_text)
-        if match_six:
-            return match_six.group(1)
+    # 剥离所有 HTML 标签，被标签隔开的内容会变成空格
+    plain_text = re.sub(r'<[^>]+>', ' ', clean_text)
+    plain_text = html.unescape(plain_text)
+    
+    # ★ 核心方案：专门捕获被空格/换行打散的 6 位连续数字 (例如 "6  4  5  9  4  3")
+    spaced_match = re.search(r'(?<!\d)(\d)\s+(\d)\s+(\d)\s+(\d)\s+(\d)\s+(\d)(?!\d)', plain_text)
+    if spaced_match:
+        return "".join(spaced_match.groups()) # 重新组合成 "645943"
         
-        # 如果被 HTML 标签或空格彻底打散，提取所有数字并尝试寻找 6 位组合
-        all_digits = "".join(re.findall(r'\d', clean_text_raw))
-        if len(all_digits) >= 6:
-            match_loose = re.search(r'(\d{6})', all_digits)
-            if match_loose:
-                return match_loose.group(1)
-    
+    # 如果不是被打散的，走常规合并空格逻辑
+    clean_text_normal = re.sub(r'\s+', ' ', plain_text).lower()
+
+    # 常规关键词精准匹配
     for kw in keywords:
-        # 放宽距离限制，从 150 提升到 250，防止短信前缀过长
-        match = re.search(rf"{kw}.{{0,250}}?(?<!\d)(\d{{4,6}})(?!\d)", clean_text_lower)
+        # 放宽距离限制，从 150 提升到 250
+        match = re.search(rf"{kw}.{{0,250}}?(?<!\d)(\d{{4,6}})(?!\d)", clean_text_normal)
         if match: return match.group(1)
         
-    filtered_text = re.sub(r'(?<!\d)106\d+(?!\d)', ' ', clean_text)               
+    # 常规暴力提取（过滤干扰项）
+    filtered_text = re.sub(r'(?<!\d)106\d+(?!\d)', ' ', clean_text_normal)               
     filtered_text = re.sub(r'(?i)uid\s*[:：]?\s*\d+', ' ', filtered_text)       
     filtered_text = re.sub(r'\d{4}-\d{2}-\d{2}', ' ', filtered_text)           
     filtered_text = re.sub(r'\d{2}:\d{2}(:\d{2})?', ' ', filtered_text)         
     filtered_text = re.sub(r'(?i)(copyright|©)\s*\d{4}', ' ', filtered_text)
-    match = re.search(r'(?<!\d)\d{4,6}(?!\d)', filtered_text)
-    return match.group(0) if match else None
+    
+    match = re.search(r'(?<!\d)(\d{4,6})(?!\d)', filtered_text)
+    return match.group(1) if match else None
 
 # ================= 📧 核心监听与去重提取引擎 =================
 def monitor_single_account(email_account, app_password):
@@ -319,11 +324,15 @@ def get_status_api():
     current_time = time.time()
     for email_acc, platforms in lock_storage.items():
         for plat, info in platforms.items():
+            
+            # ★ 在这里进行替换：如果该平台在字典中，就用字典里的值，否则用真实邮箱
+            display_email = DISPLAY_ACCOUNT_MAP.get(plat, email_acc)
+            
             for user, data in info["owners"].items():
                 is_expired = current_time >= data["expire"]
                 remaining = 0 if is_expired else int((data["expire"] - current_time) / 60) + 1
                 status_report.append({
-                    "email": email_acc, 
+                    "email": display_email, 
                     "platform": plat, 
                     "user": data["real_name"], 
                     "username": user, # 新增用于精准踢人
