@@ -134,7 +134,7 @@ def parse_verification_code_with_context(text, keywords, platform_name=""):
     # 常规关键词精准匹配
     for kw in keywords:
         # 放宽距离限制，从 150 提升到 250
-        match = re.search(rf"{kw}.{{0,250}}?(?<!\d)(\d{{4,6}})(?!\d)", clean_text_normal)
+        match = re.search(rf"{kw}.{{0,250}}?(?<!\d)(\d{{6}})(?!\d)", clean_text_normal)
         if match: return match.group(1)
         
     # 常规暴力提取（过滤干扰项）
@@ -144,7 +144,7 @@ def parse_verification_code_with_context(text, keywords, platform_name=""):
     filtered_text = re.sub(r'\d{2}:\d{2}(:\d{2})?', ' ', filtered_text)         
     filtered_text = re.sub(r'(?i)(copyright|©)\s*\d{4}', ' ', filtered_text)
     
-    match = re.search(r'(?<!\d)(\d{4,6})(?!\d)', filtered_text)
+    match = re.search(r'(?<!\d)(\d{6})(?!\d)', filtered_text)
     return match.group(1) if match else None
 
 # ================= 📧 核心监听与去重提取引擎 =================
